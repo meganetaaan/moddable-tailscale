@@ -1,0 +1,75 @@
+{
+	"include": [
+		"$(MODDABLE)/modules/web/streams/all/manifest.json"
+	],
+	"modules": {
+		"tailscale": "./modules/tailscale",
+		"tailscale/native/*": "./native/*",
+		"tailscale/idf/*": [
+			"$(IDF_PATH)/components/nvs_flash/include/nvs.h",
+			"$(IDF_PATH)/components/nvs_flash/include/nvs_flash.h",
+			"$(IDF_PATH)/components/mbedtls/esp_crt_bundle/include/esp_crt_bundle.h"
+		],
+		"microlink/core/*": [
+			"./.deps/microlink/components/microlink/include/*",
+			"./.deps/microlink/components/microlink/src/microlink.c",
+			"./.deps/microlink/components/microlink/src/ml_coord.c",
+			"./.deps/microlink/components/microlink/src/ml_derp.c",
+			"./.deps/microlink/components/microlink/src/ml_h2.c",
+			"./.deps/microlink/components/microlink/src/ml_net_io.c",
+			"./.deps/microlink/components/microlink/src/ml_noise.c",
+			"./.deps/microlink/components/microlink/src/ml_peer_nvs.c",
+			"./.deps/microlink/components/microlink/src/ml_stun.c",
+			"./.deps/microlink/components/microlink/src/ml_tcp.c",
+			"./.deps/microlink/components/microlink/src/ml_udp.c",
+			"./.deps/microlink/components/microlink/src/ml_wg_mgr.c",
+			"./.deps/microlink/components/microlink/src/nacl_box.c",
+			"./.deps/microlink/components/microlink/src/x25519.c"
+		],
+		"microlink/wireguard/*": [
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/lwip_compat.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/wireguard.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/wireguard.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/wireguard-platform.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/wireguardif.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/wireguardif.h"
+		],
+		"microlink/wireguard/refc/*": [
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/blake2s.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/blake2s.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/chacha20.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/chacha20.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/chacha20poly1305.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/chacha20poly1305.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/poly1305-donna.c",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/poly1305-donna.h",
+			"./.deps/microlink/components/microlink/components/wireguard_lwip/src/crypto/refc/x25519.h"
+		]
+	},
+	"platforms": {
+		"esp32": {
+			"dependency": [
+				{ "idf": "esp_event" },
+				{ "idf": "esp_hw_support" },
+				{ "idf": "esp_netif" },
+				{ "idf": "esp_system" },
+				{ "idf": "esp_timer" },
+				{ "idf": "esp_wifi" },
+				{
+					"name": "cjson",
+					"version": "==1.7.19~2",
+					"includes": ["cJSON"]
+				},
+				{ "idf": "lwip" },
+				{ "idf": "mbedtls" },
+				{ "idf": "nvs_flash" }
+			]
+		},
+		"...": {
+			"error": "moddable-tailscale requires ESP32"
+		}
+	}
+}

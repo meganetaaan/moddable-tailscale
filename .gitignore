@@ -1,0 +1,4 @@
+.deps/
+build/
+credentials.js
+examples/**/credentials.js

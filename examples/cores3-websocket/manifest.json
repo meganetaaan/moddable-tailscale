@@ -1,0 +1,35 @@
+{
+	"build": {
+		"ESP32_SUBCLASS": "esp32s3",
+		"USE_USB": "2",
+		"SDKCONFIGPATH": "./sdkconfig"
+	},
+	"creation": {
+		"static": 0,
+		"chunk": {
+			"initial": 131072,
+			"incremental": 0
+		},
+		"heap": {
+			"initial": 8192,
+			"incremental": 0
+		},
+		"stack": 1024
+	},
+	"include": [
+		"$(MODDABLE)/examples/manifest_base.json",
+		"$(MODDABLE)/examples/manifest_net.json",
+		"$(MODDABLE)/modules/web/streams/websocket/manifest.json",
+		"../../manifest.json"
+	],
+	"modules": {
+		"*": "./main",
+		"credentials": "./credentials"
+	},
+	"platforms": {
+		"esp32": {},
+		"...": {
+			"error": "This example requires ESP32-S3"
+		}
+	}
+}
