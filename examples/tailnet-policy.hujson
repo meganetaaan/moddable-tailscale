@@ -1,0 +1,30 @@
+{
+  // An empty owner list limits tag assignment to tailnet administrators.
+  "tagOwners": {
+    "tag:stackchan-camera": [],
+    "tag:stackchan-hub": [],
+  },
+
+  // Cameras can only upload to the hub. Tailnet members can open the dashboard.
+  "grants": [
+    {
+      "src": ["tag:stackchan-camera"],
+      "dst": ["tag:stackchan-hub"],
+      "ip": ["tcp:8080"],
+    },
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:stackchan-hub"],
+      "ip": ["tcp:8080"],
+    },
+  ],
+
+  "tests": [
+    {
+      "src": "tag:stackchan-camera",
+      "proto": "tcp",
+      "accept": ["tag:stackchan-hub:8080"],
+      "deny": ["tag:stackchan-hub:22", "tag:stackchan-hub:80"],
+    },
+  ],
+}

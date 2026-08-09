@@ -1,4 +1,8 @@
-import { createCameraRegistry } from "./camera-server.ts";
+import {
+  type CameraRegistry,
+  type CameraRegistryOptions,
+  createCameraRegistry,
+} from "./camera-server.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -88,16 +92,17 @@ async function connectDevice(baseURL: string, deviceId: string) {
 }
 
 async function withServer(
-  run: (baseURL: string) => Promise<void>,
+  run: (baseURL: string, registry: CameraRegistry) => Promise<void>,
+  options: CameraRegistryOptions = {},
 ): Promise<void> {
-  const registry = createCameraRegistry({ log() {} });
+  const registry = createCameraRegistry({ log() {}, ...options });
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: 0, onListen() {} },
     registry.handler,
   );
   const address = server.addr as Deno.NetAddr;
   try {
-    await run(`http://127.0.0.1:${address.port}`);
+    await run(`http://127.0.0.1:${address.port}`, registry);
   } finally {
     registry.close();
     await server.shutdown();
@@ -105,6 +110,7 @@ async function withServer(
 }
 
 const JPEG = new Uint8Array([0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9]);
+const SECOND_JPEG = new Uint8Array([0xff, 0xd8, 0x03, 0x04, 0xff, 0xd9]);
 
 Deno.test("serves syntactically valid BLE provisioning JavaScript", async () => {
   await withServer(async (baseURL) => {
@@ -327,4 +333,68 @@ Deno.test("keeps the final image and marks disconnected devices offline", async 
       "last image contents changed",
     );
   });
+});
+
+Deno.test("restores device metadata and the final JPEG after a hub restart", async () => {
+  const stateDirectory = await Deno.makeTempDir({
+    prefix: "stackchan-camera-state-",
+  });
+  const deviceId = "cores3-aabbcc000007";
+  try {
+    await withServer(async (baseURL, registry) => {
+      const device = await connectDevice(baseURL, deviceId);
+      try {
+        device.socket.send(JPEG);
+        let firstFrameAccepted = false;
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const detail = await fetch(`${baseURL}/api/devices/${deviceId}`).then(
+            (result) => result.json(),
+          );
+          if (detail.frameCount === 1) {
+            firstFrameAccepted = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert(firstFrameAccepted, "first frame was not accepted");
+        registry.flush();
+        device.socket.send(SECOND_JPEG);
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const detail = await fetch(`${baseURL}/api/devices/${deviceId}`).then(
+            (result) => result.json(),
+          );
+          if (detail.frameCount === 2) {
+            registry.flush();
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error(
+          "second frame was not accepted before persistence flush",
+        );
+      } finally {
+        device.socket.close();
+      }
+    }, { stateDirectory, persistenceDelayMs: 60_000 });
+
+    await withServer(async (baseURL) => {
+      const detail = await fetch(`${baseURL}/api/devices/${deviceId}`).then(
+        (result) => result.json(),
+      );
+      assert(detail.deviceId === deviceId, "persisted device was not restored");
+      assert(!detail.online, "restored device must start offline");
+      assert(detail.frameCount === 2, "persisted frame count changed");
+      assert(detail.hasFrame, "persisted final-frame flag was lost");
+      const latest = await fetch(`${baseURL}/devices/${deviceId}/latest.jpg`);
+      assert(latest.ok, "persisted final JPEG is unavailable");
+      const frame = new Uint8Array(await latest.arrayBuffer());
+      assert(
+        frame.byteLength === SECOND_JPEG.byteLength &&
+          frame.every((byte, index) => byte === SECOND_JPEG[index]),
+        "persisted final JPEG contents changed",
+      );
+    }, { stateDirectory, persistenceDelayMs: 60_000 });
+  } finally {
+    await Deno.remove(stateDirectory, { recursive: true });
+  }
 });

@@ -5,6 +5,8 @@ const BOUNDARY = "stackchan-camera-frame";
 const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_COMMAND_HISTORY = 20;
 const PROTOCOL_VERSION = 1;
+const PERSISTENCE_VERSION = 1;
+const DEFAULT_PERSISTENCE_DELAY_MS = 1_000;
 const VIEWER_FPS = Object.freeze({ none: 1, grid: 2, detail: 8 });
 const encoder = new TextEncoder();
 
@@ -106,14 +108,152 @@ export type DeviceSummary = {
 export type CameraRegistry = {
   handler: (request: Request) => Response | Promise<Response>;
   devices: () => DeviceSummary[];
+  flush: () => void;
   close: () => void;
 };
 
+export type CameraRegistryOptions = {
+  log?: (message: string) => void;
+  stateDirectory?: string;
+  persistenceDelayMs?: number;
+};
+
+type PersistedDevice = {
+  deviceId: string;
+  hello: DeviceHello;
+  connectedAt: string | null;
+  disconnectedAt: string | null;
+  lastSeenAt: string;
+  frameCount: number;
+  lastFrameAt: string | null;
+  lastFrameBytes: number;
+  commands: CommandHistory[];
+};
+
 export function createCameraRegistry(
-  options: { log?: (message: string) => void } = {},
+  options: CameraRegistryOptions = {},
 ): CameraRegistry {
   const log = options.log ?? console.log;
+  const stateDirectory = options.stateDirectory
+    ? normalizeDirectory(options.stateDirectory)
+    : undefined;
+  const persistenceDelayMs = options.persistenceDelayMs ??
+    DEFAULT_PERSISTENCE_DELAY_MS;
+  if (!Number.isFinite(persistenceDelayMs) || persistenceDelayMs < 0) {
+    throw new RangeError("persistenceDelayMs must be zero or greater");
+  }
   const registry = new Map<string, DeviceRecord>();
+  const dirtyFrames = new Set<string>();
+  let stateDirty = false;
+  let persistenceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function schedulePersistence(): void {
+    if (!stateDirectory || persistenceTimer !== undefined) return;
+    persistenceTimer = setTimeout(() => {
+      persistenceTimer = undefined;
+      try {
+        flush();
+      } catch (error) {
+        log(`camera state persistence failed: ${errorMessage(error)}`);
+        schedulePersistence();
+      }
+    }, persistenceDelayMs);
+  }
+
+  function markDirty(record?: DeviceRecord, frame = false): void {
+    if (!stateDirectory) return;
+    stateDirty = true;
+    if (frame && record) dirtyFrames.add(record.deviceId);
+    schedulePersistence();
+  }
+
+  function flush(): void {
+    if (!stateDirectory || (!stateDirty && dirtyFrames.size === 0)) return;
+    if (persistenceTimer !== undefined) {
+      clearTimeout(persistenceTimer);
+      persistenceTimer = undefined;
+    }
+    const framesDirectory = statePath(stateDirectory, "frames");
+    Deno.mkdirSync(framesDirectory, { recursive: true });
+    for (const deviceId of dirtyFrames) {
+      const frame = registry.get(deviceId)?.latestFrame;
+      if (frame) {
+        atomicWriteFile(
+          statePath(framesDirectory, `${deviceId}.jpg`),
+          frame,
+        );
+      }
+    }
+    const persisted = {
+      version: PERSISTENCE_VERSION,
+      devices: [...registry.values()].map(persistDevice),
+    };
+    atomicWriteFile(
+      statePath(stateDirectory, "registry.json"),
+      encoder.encode(`${JSON.stringify(persisted, null, 2)}\n`),
+    );
+    dirtyFrames.clear();
+    stateDirty = false;
+  }
+
+  function loadState(): void {
+    if (!stateDirectory) return;
+    const registryPath = statePath(stateDirectory, "registry.json");
+    let raw: string;
+    try {
+      raw = Deno.readTextFileSync(registryPath);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return;
+      log(`camera state could not be read: ${errorMessage(error)}`);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as {
+        version?: unknown;
+        devices?: unknown;
+      };
+      if (
+        parsed.version !== PERSISTENCE_VERSION ||
+        !Array.isArray(parsed.devices)
+      ) throw new Error("unsupported registry format");
+      for (const value of parsed.devices) {
+        const persisted = parsePersistedDevice(value);
+        if (!persisted) {
+          log("ignored an invalid persisted camera record");
+          continue;
+        }
+        const record: DeviceRecord = {
+          ...persisted,
+          viewers: new Set(),
+          desiredFps: VIEWER_FPS.none,
+        };
+        try {
+          const frame = Deno.readFileSync(
+            statePath(
+              statePath(stateDirectory, "frames"),
+              `${record.deviceId}.jpg`,
+            ),
+          );
+          if (frame.byteLength <= MAX_FRAME_BYTES && isJpeg(frame)) {
+            record.latestFrame = frame;
+            record.lastFrameBytes = frame.byteLength;
+          } else log(`ignored invalid persisted JPEG for ${record.deviceId}`);
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) {
+            log(
+              `persisted JPEG could not be read for ${record.deviceId}: ${
+                errorMessage(error)
+              }`,
+            );
+          }
+        }
+        registry.set(record.deviceId, record);
+      }
+      log(`restored ${registry.size} camera device(s) from ${stateDirectory}`);
+    } catch (error) {
+      log(`camera state is invalid: ${errorMessage(error)}`);
+    }
+  }
 
   function summarize(record: DeviceRecord): DeviceSummary {
     let grid = 0;
@@ -180,6 +320,7 @@ export function createCameraRegistry(
       MAX_COMMAND_HISTORY,
     );
     record.socket.send(JSON.stringify(message));
+    markDirty();
     log(`command ${message.commandId} ${command} -> ${record.deviceId}`);
     return history;
   }
@@ -225,6 +366,7 @@ export function createCameraRegistry(
     record.frameCount += 1;
     record.lastFrameAt = record.lastSeenAt = new Date().toISOString();
     record.lastFrameBytes = frame.byteLength;
+    markDirty(record, true);
     const part = encodeMultipartFrame(record.latestFrame);
     let viewerRemoved = false;
     for (const viewer of record.viewers) {
@@ -310,6 +452,7 @@ export function createCameraRegistry(
       deviceId: record.deviceId,
     }));
     updateStreamRate(record);
+    markDirty();
     log(`device online: ${record.deviceId} (${hello.model})`);
     return record;
   }
@@ -327,6 +470,7 @@ export function createCameraRegistry(
     history.result = ack.result;
     history.error = ack.error;
     record.lastSeenAt = history.acknowledgedAt;
+    markDirty();
     log(`command ${ack.commandId} ${history.status} <- ${record.deviceId}`);
   }
 
@@ -378,6 +522,7 @@ export function createCameraRegistry(
         record.socket = undefined;
         record.requestedFps = undefined;
         record.disconnectedAt = record.lastSeenAt = new Date().toISOString();
+        markDirty();
         log(`device offline: ${record.deviceId}`);
       }
     };
@@ -485,12 +630,133 @@ export function createCameraRegistry(
   function close(): void {
     for (const record of registry.values()) {
       if (record.socket?.readyState === WebSocket.OPEN) {
-        record.socket.close(1001, "hub shutting down");
+        const socket = record.socket;
+        socket.close(1001, "hub shutting down");
+        record.socket = undefined;
+        record.requestedFps = undefined;
+        record.disconnectedAt = record.lastSeenAt = new Date().toISOString();
+        markDirty();
       }
+    }
+    try {
+      flush();
+    } catch (error) {
+      log(`camera state shutdown flush failed: ${errorMessage(error)}`);
     }
   }
 
-  return { handler, devices, close };
+  loadState();
+  return { handler, devices, flush, close };
+}
+
+function persistDevice(record: DeviceRecord): PersistedDevice {
+  return {
+    deviceId: record.deviceId,
+    hello: record.hello,
+    connectedAt: record.connectedAt,
+    disconnectedAt: record.disconnectedAt,
+    lastSeenAt: record.lastSeenAt,
+    frameCount: record.frameCount,
+    lastFrameAt: record.lastFrameAt,
+    lastFrameBytes: record.lastFrameBytes,
+    commands: record.commands,
+  };
+}
+
+function parsePersistedDevice(value: unknown): PersistedDevice | undefined {
+  if (!isObject(value)) return undefined;
+  const hello = parseDeviceHello(JSON.stringify(value.hello));
+  if (
+    !hello || value.deviceId !== hello.deviceId ||
+    !nullableTimestamp(value.connectedAt) ||
+    !nullableTimestamp(value.disconnectedAt) ||
+    !validTimestamp(value.lastSeenAt) ||
+    !nonNegativeInteger(value.frameCount) ||
+    !nullableTimestamp(value.lastFrameAt) ||
+    !nonNegativeInteger(value.lastFrameBytes) ||
+    !Array.isArray(value.commands)
+  ) return undefined;
+  const commands: CommandHistory[] = [];
+  for (const persistedCommand of value.commands) {
+    const command = parseCommandHistory(persistedCommand);
+    if (command) commands.push(command);
+  }
+  return {
+    deviceId: hello.deviceId,
+    hello,
+    connectedAt: value.connectedAt as string | null,
+    disconnectedAt: value.disconnectedAt as string | null,
+    lastSeenAt: value.lastSeenAt as string,
+    frameCount: value.frameCount as number,
+    lastFrameAt: value.lastFrameAt as string | null,
+    lastFrameBytes: value.lastFrameBytes as number,
+    commands,
+  };
+}
+
+function parseCommandHistory(value: unknown): CommandHistory | undefined {
+  if (
+    !isObject(value) || typeof value.commandId !== "string" ||
+    !isCommandName(value.command) ||
+    (value.source !== "viewer" && value.source !== "api") ||
+    (value.status !== "pending" && value.status !== "ok" &&
+      value.status !== "error") ||
+    !validTimestamp(value.sentAt) || !nullableTimestamp(value.acknowledgedAt)
+  ) return undefined;
+  if (
+    value.error !== undefined &&
+    (!isObject(value.error) || typeof value.error.message !== "string")
+  ) return undefined;
+  return value as CommandHistory;
+}
+
+function validTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function nullableTimestamp(value: unknown): value is string | null {
+  return value === null || validTimestamp(value);
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function normalizeDirectory(value: string): string {
+  const directory = value.trim();
+  if (!directory) throw new RangeError("stateDirectory must not be empty");
+  return directory;
+}
+
+function statePath(directory: string, name: string): string {
+  return /[\\/]$/.test(directory)
+    ? `${directory}${name}`
+    : `${directory}/${name}`;
+}
+
+function atomicWriteFile(path: string, data: Uint8Array): void {
+  const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+  try {
+    Deno.writeFileSync(temporaryPath, data);
+    try {
+      Deno.renameSync(temporaryPath, path);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
+      // Windows does not replace an existing destination with renameSync.
+      Deno.removeSync(path);
+      Deno.renameSync(temporaryPath, path);
+    }
+  } finally {
+    try {
+      Deno.removeSync(temporaryPath);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function parseDeviceHello(value: string): DeviceHello | undefined {
@@ -870,10 +1136,36 @@ function parsePort(value: string | undefined): number {
   return port;
 }
 
+function parseCommandLine(args: string[]): {
+  port: number;
+  hostname: string;
+  stateDirectory?: string;
+} {
+  const positional: string[] = [];
+  let stateDirectory: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--state-dir") {
+      stateDirectory = args[++index];
+      if (!stateDirectory) throw new Error("--state-dir requires a path");
+    } else if (argument.startsWith("--state-dir=")) {
+      stateDirectory = argument.slice("--state-dir=".length);
+      if (!stateDirectory) throw new Error("--state-dir requires a path");
+    } else if (argument.startsWith("--")) {
+      throw new Error(`unknown option: ${argument}`);
+    } else positional.push(argument);
+  }
+  if (positional.length > 2) throw new Error("too many positional arguments");
+  return {
+    port: parsePort(positional[0]),
+    hostname: positional[1] ?? DEFAULT_HOSTNAME,
+    stateDirectory,
+  };
+}
+
 if (import.meta.main) {
-  const port = parsePort(Deno.args[0]);
-  const hostname = Deno.args[1] ?? DEFAULT_HOSTNAME;
-  const registry = createCameraRegistry();
+  const { port, hostname, stateDirectory } = parseCommandLine(Deno.args);
+  const registry = createCameraRegistry({ stateDirectory });
   const hostnames = [hostname];
   if (
     hostname !== "0.0.0.0" && hostname !== "::" &&
@@ -881,11 +1173,25 @@ if (import.meta.main) {
     hostname.toLowerCase() !== "localhost"
   ) hostnames.push("127.0.0.1");
 
+  const servers: ReturnType<typeof Deno.serve>[] = [];
   for (const bindAddress of hostnames) {
     console.log(
       `Device WebSocket: ws://${bindAddress}:${port}${CAMERA_PATH}`,
     );
     console.log(`Camera dashboard: http://${bindAddress}:${port}/`);
-    Deno.serve({ hostname: bindAddress, port }, registry.handler);
+    servers.push(Deno.serve({ hostname: bindAddress, port }, registry.handler));
+  }
+  if (stateDirectory) console.log(`Camera state: ${stateDirectory}`);
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    registry.close();
+    await Promise.all(servers.map((server) => server.shutdown()));
+  };
+  Deno.addSignalListener("SIGINT", () => void shutdown());
+  if (Deno.build.os !== "windows") {
+    Deno.addSignalListener("SIGTERM", () => void shutdown());
   }
 }
