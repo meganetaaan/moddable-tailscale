@@ -138,8 +138,14 @@ mcconfig -m -p esp32/m5stack_cores3
 
 サンプルはCoreS3の画面へWi-Fi、Tailnet、WebSocket、カメラ送信の状態を表示します。
 CoreS3固有の電源・I2C・ディスプレイ設定を使うため、`-p esp32/m5stack_cores3`を指定します。
-配信確立後にhubとのtransportが異常終了した場合は、ESP32版WebSocketStreamの停止回避として
+配信確立後にhubとのWebSocketが終了した場合は、ESP32版WebSocketStreamの停止回避として
 CoreS3を明示的に再起動し、Wi-Fi/Tailnet登録から自動復旧します。初回接続失敗は再起動せず再試行します。
+Tailnet上の分割送信と競合するDenoのcontrol-frame pingは無効化し、hubが10秒ごとに
+`heartbeat.ping`を送り、CoreS3が`heartbeat.pong`を返します。30秒応答がなければ切断します。
+CoreS3はpong送信を待たず制御メッセージの受信を続け、25秒pingを受信できなければ
+JS外のESP-IDF timer watchdogが再起動して復旧します。
+WireGuard handshakeにはSNTP同期済みのwall clockを使い、再起動後の古いuptimeがreplay判定されるのを防ぎます。
+USBモニター未接続時の出力詰まりを避けるため、映像フレームとWireGuard DATAパケットのログは間引かれます。
 
 ### 個体設定
 

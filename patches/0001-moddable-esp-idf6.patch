@@ -16,6 +16,18 @@ index 6627fd0..b947e47 100644
  								} else {
  									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
  								}
+@@ -755,8 +756,9 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
+ 
+ 	uint8_t type = wireguard_get_message_type(data, len);
+ 
+-	// Always log incoming WG packets (critical for debugging handshake issues)
+-	printf("[WG_RX] type=%d (%s) len=%u from %s:%u\n",
++	// Packet-level DATA logging can fill the USB serial buffer and block the app.
++	// Handshake diagnostics below remain enabled; full packet logs are debug-only.
++	WG_DEBUG("[WG_RX] type=%d (%s) len=%u from %s:%u\n",
+ 		type,
+ 		type == 1 ? "INIT" : type == 2 ? "RESP" : type == 3 ? "COOKIE" : type == 4 ? "DATA" : "?",
+ 		(unsigned)len,
 diff --git a/components/microlink/include/microlink_internal.h b/components/microlink/include/microlink_internal.h
 index add69c7..1c68b17 100644
 --- a/components/microlink/include/microlink_internal.h
@@ -572,3 +584,85 @@ index 1b0fac2..aa8fd82 100644
                                    ciphertext, ct_len, plaintext) != 0) {
          ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)nonce);
          return ESP_ERR_INVALID_MAC;
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+index f974c67..f0feaf0 100644
+--- a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+@@ -5,9 +5,9 @@
+ 
+ #include "wireguard-platform.h"
+ #include "esp_random.h"
+-#include "esp_timer.h"
+ #include "lwip/sys.h"
+ #include <string.h>
++#include <sys/time.h>
+ 
+ /* ============================================================================
+  * Time Functions
+@@ -20,17 +20,12 @@ uint32_t wireguard_sys_now() {
+ 
+ void wireguard_tai64n_now(uint8_t *output) {
+     // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
+-    // For simplicity, use Unix epoch time
+-    uint64_t now_us = esp_timer_get_time();
+-    uint64_t seconds = now_us / 1000000ULL;
+-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
+-
+-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
+-    static uint64_t last_log_s = 0;
+-    if (seconds - last_log_s >= 5) {
+-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
+-        last_log_s = seconds;
+-    }
++    // WireGuard rejects replayed handshake timestamps. ESP timer uptime resets
++    // on every boot, so use the SNTP-synchronized wall clock instead.
++    struct timeval now;
++    gettimeofday(&now, NULL);
++    uint64_t seconds = (uint64_t)now.tv_sec;
++    uint32_t nanoseconds = (uint32_t)now.tv_usec * 1000;
+ 
+     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)
+     // Add TAI offset: 2^62 + Unix time
+diff --git a/components/microlink/src/ml_wg_mgr.c b/components/microlink/src/ml_wg_mgr.c
+index ed40942..bda8fb2 100644
+--- a/components/microlink/src/ml_wg_mgr.c
++++ b/components/microlink/src/ml_wg_mgr.c
+@@ -186,9 +186,9 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
+     microlink_t *ml = (microlink_t *)ctx;
+     if (!ml) return ERR_CONN;
+ 
+-    /* Log WG packets sent via direct UDP */
++    /* Per-packet logs are debug-only: INFO output can block when USB is unread. */
+     uint32_t ip_host = ntohl(dest_ip);
+-    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
++    ESP_LOGD(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
+              (int)len,
+              (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
+              (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
+@@ -1145,7 +1145,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
+  * ========================================================================== */
+ 
+ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
+-    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
++    ESP_LOGD(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
+              (int)pkt->len, pkt->via_derp,
+              pkt->len >= 4 ? pkt->data[0] : -1,
+              pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
+@@ -1621,7 +1621,7 @@ void ml_wg_mgr_task(void *arg) {
+             wireguardif_periodic((struct netif *)ml->wg_netif);
+             uint64_t dt = ml_get_time_ms() - t0;
+             last_wg_periodic_ms = now;
+-            ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
++            ESP_LOGD(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+         }
+ 
+         /* Periodic DISCO probes (every 1s check) */
+@@ -1631,7 +1631,7 @@ void ml_wg_mgr_task(void *arg) {
+             disco_periodic_probes(ml);
+             uint64_t dt = ml_get_time_ms() - t0;
+             last_disco_probe_ms = now;
+-            ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
++            ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+         }
+ 
+         /* Yield - 10ms loop rate for minimum packet processing latency.

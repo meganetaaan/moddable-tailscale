@@ -5,6 +5,8 @@ const BOUNDARY = "stackchan-camera-frame";
 const MAX_FRAME_BYTES = 512 * 1024;
 const MAX_COMMAND_HISTORY = 20;
 const PROTOCOL_VERSION = 1;
+const HEARTBEAT_INTERVAL_MS = 10_000;
+const HEARTBEAT_TIMEOUT_MS = 30_000;
 const VIEWER_FPS = Object.freeze({ none: 1, grid: 2, detail: 8 });
 const encoder = new TextEncoder();
 
@@ -48,6 +50,12 @@ type CommandAck = {
   error?: { code?: string; message: string };
 };
 
+type HeartbeatPong = {
+  type: "heartbeat.pong";
+  protocol: 1;
+  pingId: string;
+};
+
 type CommandHistory = {
   commandId: string;
   command: DeviceCommandName;
@@ -80,6 +88,8 @@ type DeviceRecord = {
   viewers: Set<Viewer>;
   desiredFps: number;
   requestedFps?: number;
+  lastPongAt: string | null;
+  heartbeatLatencyMs: number | null;
   commands: CommandHistory[];
 };
 
@@ -100,19 +110,35 @@ export type DeviceSummary = {
   hasFrame: boolean;
   viewers: { grid: number; detail: number; total: number };
   desiredFps: number;
+  heartbeat: { lastPongAt: string | null; latencyMs: number | null };
   commands: CommandHistory[];
 };
 
 export type CameraRegistry = {
   handler: (request: Request) => Response | Promise<Response>;
   devices: () => DeviceSummary[];
+  close: () => void;
 };
 
 export function createCameraRegistry(
-  options: { log?: (message: string) => void } = {},
+  options: {
+    log?: (message: string) => void;
+    heartbeatIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
+  } = {},
 ): CameraRegistry {
   const log = options.log ?? console.log;
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ??
+    HEARTBEAT_INTERVAL_MS;
+  const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS;
+  if (
+    !positiveInteger(heartbeatIntervalMs) ||
+    !positiveInteger(heartbeatTimeoutMs)
+  ) {
+    throw new RangeError("heartbeat intervals must be positive integers");
+  }
   const registry = new Map<string, DeviceRecord>();
+  const heartbeatTimers = new Set<ReturnType<typeof setInterval>>();
 
   function summarize(record: DeviceRecord): DeviceSummary {
     let grid = 0;
@@ -138,6 +164,10 @@ export function createCameraRegistry(
       hasFrame: !!record.latestFrame,
       viewers: { grid, detail, total: grid + detail },
       desiredFps: record.desiredFps,
+      heartbeat: {
+        lastPongAt: record.lastPongAt,
+        latencyMs: record.heartbeatLatencyMs,
+      },
       commands: record.commands.map((entry) => ({ ...entry })),
     };
   }
@@ -289,6 +319,8 @@ export function createCameraRegistry(
         lastFrameBytes: 0,
         viewers: new Set(),
         desiredFps: VIEWER_FPS.none,
+        lastPongAt: null,
+        heartbeatLatencyMs: null,
         commands: [],
       };
       registry.set(hello.deviceId, record);
@@ -301,6 +333,8 @@ export function createCameraRegistry(
       record.disconnectedAt = null;
       record.lastSeenAt = now;
       record.requestedFps = undefined;
+      record.lastPongAt = null;
+      record.heartbeatLatencyMs = null;
     }
     record.socket = socket;
     socket.send(JSON.stringify({
@@ -330,11 +364,42 @@ export function createCameraRegistry(
   }
 
   function upgradeCamera(request: Request): Response {
-    const { socket, response } = Deno.upgradeWebSocket(request);
+    const { socket, response } = Deno.upgradeWebSocket(request, {
+      // Moddable's automatic control-frame pong can stall while a fragmented
+      // Tailnet write is active. Use normal WebSocket heartbeat messages below.
+      idleTimeout: 0,
+    });
     socket.binaryType = "arraybuffer";
     let record: DeviceRecord | undefined;
+    let pendingPingId: string | undefined;
+    let pendingPingAt = 0;
+    let lastInboundAt = Date.now();
+    const heartbeatTimer = setInterval(() => {
+      if (!record || socket.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      if (pendingPingId) {
+        // A camera frame is as strong a liveness signal as a pong. Under upload
+        // backpressure the pong may queue behind a fragmented JPEG, so only close
+        // after the socket has been completely silent for the timeout window.
+        if ((now - lastInboundAt) >= heartbeatTimeoutMs) {
+          log(`heartbeat timeout: ${record.deviceId}`);
+          socket.close(1013, "heartbeat timeout");
+        }
+        return;
+      }
+      pendingPingId = crypto.randomUUID();
+      pendingPingAt = now;
+      socket.send(JSON.stringify({
+        type: "heartbeat.ping",
+        protocol: PROTOCOL_VERSION,
+        pingId: pendingPingId,
+        sentAt: new Date(now).toISOString(),
+      }));
+    }, heartbeatIntervalMs);
+    heartbeatTimers.add(heartbeatTimer);
 
     socket.onmessage = async (event) => {
+      lastInboundAt = Date.now();
       if (typeof event.data === "string") {
         const hello = parseDeviceHello(event.data);
         if (hello) {
@@ -347,6 +412,16 @@ export function createCameraRegistry(
         }
         if (!record) {
           socket.close(1008, "device.hello required");
+          return;
+        }
+        const pong = parseHeartbeatPong(event.data);
+        if (pong) {
+          if (pong.pingId === pendingPingId) {
+            const now = Date.now();
+            record.lastPongAt = record.lastSeenAt = new Date(now).toISOString();
+            record.heartbeatLatencyMs = now - pendingPingAt;
+            pendingPingId = undefined;
+          }
           return;
         }
         const ack = parseCommandAck(event.data);
@@ -368,6 +443,8 @@ export function createCameraRegistry(
       if (record) log(`device WebSocket error: ${record.deviceId}`);
     };
     socket.onclose = () => {
+      clearInterval(heartbeatTimer);
+      heartbeatTimers.delete(heartbeatTimer);
       if (record?.socket === socket) {
         record.socket = undefined;
         record.requestedFps = undefined;
@@ -476,7 +553,17 @@ export function createCameraRegistry(
     return new Response("Not found\n", { status: 404 });
   }
 
-  return { handler, devices };
+  function close(): void {
+    for (const timer of heartbeatTimers) clearInterval(timer);
+    heartbeatTimers.clear();
+    for (const record of registry.values()) {
+      if (record.socket?.readyState === WebSocket.OPEN) {
+        record.socket.close(1001, "hub shutting down");
+      }
+    }
+  }
+
+  return { handler, devices, close };
 }
 
 function parseDeviceHello(value: string): DeviceHello | undefined {
@@ -519,6 +606,21 @@ function parseCommandAck(value: string): CommandAck | undefined {
       (!isObject(parsed.error) || typeof parsed.error.message !== "string")
     ) return undefined;
     return parsed as CommandAck;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseHeartbeatPong(value: string): HeartbeatPong | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<HeartbeatPong>;
+    if (
+      parsed.type !== "heartbeat.pong" ||
+      parsed.protocol !== PROTOCOL_VERSION ||
+      typeof parsed.pingId !== "string" ||
+      !parsed.pingId.length || parsed.pingId.length > 80
+    ) return undefined;
+    return parsed as HeartbeatPong;
   } catch {
     return undefined;
   }

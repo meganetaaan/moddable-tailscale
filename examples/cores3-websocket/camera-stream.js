@@ -137,10 +137,14 @@ export default class CameraStream {
 			imageType: Bitmap.RGB565LE,
 			format: "buffer/disposable",
 			onReadable: () => {
+				// Keep at most one JS-owned frame. If the network write is blocked,
+				// leaving the native buffers queued applies backpressure without
+				// flooding the JS event loop and starving heartbeat timers.
+				if (this.latestFrame)
+					return;
 				const frame = camera.read();
 				if (!frame)
 					return;
-				this.latestFrame?.close?.();
 				this.latestFrame = frame;
 			},
 		});
@@ -151,8 +155,12 @@ export default class CameraStream {
 	}
 
 	takeLatestFrame() {
-		const frame = this.latestFrame;
+		let frame = this.latestFrame;
 		this.latestFrame = undefined;
+		// onReadable notifications may already have been consumed while a frame
+		// was pending. Pull one queued native frame directly on the next tick.
+		if (!frame && this.camera)
+			frame = this.camera.read();
 		return frame;
 	}
 

@@ -76,6 +76,9 @@ class WebSocketStream {
 						}
 						break;
 					case this.#client.constructor.ping:
+						// WebSocketClient automatically queues the RFC 6455 pong with
+						// the same payload after this control callback returns.
+						break;
 					case this.#client.constructor.pong:
 						break;
 				}
@@ -108,17 +111,22 @@ class WebSocketStream {
 					const buffer = buffers[0];
 					const writeOptions = buffer.options;
 					const writeData = buffer.data;
-					const dataLength = writeData.byteLength;
+					const offset = buffer.offset;
+					const dataLength = writeData.byteLength - offset;
 					const writableLength = this.#writableLength;
 					if (dataLength <= writableLength) {
-						this.#writableLength = this.#clientWrite(writeData, writeOptions);
+						const data = offset
+							? new Uint8Array(writeData, offset, dataLength)
+							: writeData;
+						this.#writableLength = this.#clientWrite(data, writeOptions);
 						buffer.result?.resolve();
 						buffers.shift();
 					}
 					else if (writableLength > 0) {
 						const moreOptions = {...writeOptions, more: true};
-						this.#writableLength = this.#clientWrite(writeData.slice(0, writableLength), moreOptions);
-						buffer.data = writeData.slice(writableLength);
+						const data = new Uint8Array(writeData, offset, writableLength);
+						this.#writableLength = this.#clientWrite(data, moreOptions);
+						buffer.offset += writableLength;
 						break;
 					}
 					else
@@ -176,7 +184,10 @@ class WebSocketStream {
 					binary = true;
 				else if ((data instanceof DataView) || (data instanceof TypedArray)) {
 					binary = true;
-					data = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+					if ((data.byteOffset === 0) && (data.byteLength === data.buffer.byteLength))
+						data = data.buffer;
+					else
+						data = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 				}
 				else
 					data = ArrayBuffer.fromString(data);
@@ -264,7 +275,7 @@ class WebSocketStream {
 		const buffers = this.#writableBuffers;
 		let buffer = null;
 		if (buffers.length)
-			buffer = {data, options};
+			buffer = {data, offset: 0, options};
 		else {
 			const dataLength = data.byteLength;
 			const writableLength = this.#writableLength;
@@ -272,11 +283,11 @@ class WebSocketStream {
 				this.#writableLength = this.#clientWrite(data, options);
 			else if (writableLength > 0) {
 				const moreOptions = {...options, more: true};
-				this.#writableLength = this.#clientWrite(data.slice(0, writableLength), moreOptions);
-				buffer = {data: data.slice(writableLength), options};
+				this.#writableLength = this.#clientWrite(new Uint8Array(data, 0, writableLength), moreOptions);
+				buffer = {data, offset: writableLength, options};
 			}
 			else
-				buffer = {data, options};
+				buffer = {data, offset: 0, options};
 		}
 		if (buffer)
 			buffers.push(buffer);

@@ -3,6 +3,7 @@
 
 #include "esp_mac.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "nvs.h"
@@ -20,6 +21,16 @@
 
 static bool gNVSInitialized;
 static bool gUSBInitialized;
+static esp_timer_handle_t gHeartbeatWatchdog;
+static uint32_t gHeartbeatWatchdogTicks;
+static volatile uint32_t gHeartbeatWatchdogRemaining;
+
+static void heartbeat_watchdog_callback(void *context) {
+	(void)context;
+	uint32_t remaining = __atomic_load_n(&gHeartbeatWatchdogRemaining, __ATOMIC_RELAXED);
+	if (remaining && (__atomic_sub_fetch(&gHeartbeatWatchdogRemaining, 1, __ATOMIC_RELAXED) == 0))
+		esp_restart();
+}
 
 static bool ensure_usb(void) {
 #ifdef mxDebug
@@ -140,6 +151,41 @@ void xs_device_config_clear(xsMachine *the) {
 
 void xs_device_config_restart(xsMachine *the) {
 	esp_restart();
+}
+
+void xs_device_config_watchdog_start(xsMachine *the) {
+	int timeout = xsmcToInteger(xsArg(0));
+	esp_err_t err;
+	if ((timeout < 5000) || (timeout > 300000))
+		xsRangeError("invalid heartbeat watchdog timeout");
+	if (!gHeartbeatWatchdog) {
+		const esp_timer_create_args_t args = {
+			.callback = heartbeat_watchdog_callback,
+			.name = "stackcam-heartbeat",
+		};
+		err = esp_timer_create(&args, &gHeartbeatWatchdog);
+		if (err != ESP_OK)
+			xsUnknownError("cannot create heartbeat watchdog");
+	}
+	esp_timer_stop(gHeartbeatWatchdog);
+	gHeartbeatWatchdogTicks = (timeout + 999) / 1000;
+	__atomic_store_n(&gHeartbeatWatchdogRemaining, gHeartbeatWatchdogTicks, __ATOMIC_RELAXED);
+	err = esp_timer_start_periodic(gHeartbeatWatchdog, 1000000);
+	if (err != ESP_OK)
+		xsUnknownError("cannot start heartbeat watchdog");
+}
+
+void xs_device_config_watchdog_feed(xsMachine *the) {
+	(void)the;
+	if (gHeartbeatWatchdogTicks)
+		__atomic_store_n(&gHeartbeatWatchdogRemaining, gHeartbeatWatchdogTicks, __ATOMIC_RELAXED);
+}
+
+void xs_device_config_watchdog_stop(xsMachine *the) {
+	(void)the;
+	__atomic_store_n(&gHeartbeatWatchdogRemaining, 0, __ATOMIC_RELAXED);
+	if (gHeartbeatWatchdog)
+		esp_timer_stop(gHeartbeatWatchdog);
 }
 
 void xs_device_config_usb_read(xsMachine *the) {

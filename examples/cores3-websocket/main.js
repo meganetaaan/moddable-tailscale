@@ -15,6 +15,7 @@ const PROTOCOL_VERSION = 1;
 const FIRMWARE_VERSION = "0.2.0";
 const CAPABILITIES = Object.freeze(["camera", "display", "provision.usb", "provision.ble"]);
 const WEBSOCKET_WRITE_TIMEOUT = 10_000;
+const HEARTBEAT_WATCHDOG_MS = 25_000;
 
 let tailnet;
 let webSocket;
@@ -145,7 +146,7 @@ async function handleCommand(message, writer, cameraStream) {
 	}));
 }
 
-async function readServerMessages(readable, writer, cameraStream, socket) {
+async function readServerMessages(readable, writer, cameraStream, socket, onHeartbeat) {
 	const reader = readable.getReader();
 	try {
 		while (webSocket === socket) {
@@ -154,7 +155,6 @@ async function readServerMessages(readable, writer, cameraStream, socket) {
 				break;
 			if (typeof value !== "string")
 				continue;
-			trace("WebSocket RX: ", value, "\n");
 			let message;
 			try {
 				message = JSON.parse(value);
@@ -162,6 +162,20 @@ async function readServerMessages(readable, writer, cameraStream, socket) {
 			catch {
 				continue;
 			}
+			if (message.type === "heartbeat.ping") {
+				if ((message.protocol === PROTOCOL_VERSION) && (typeof message.pingId === "string")) {
+					onHeartbeat();
+					// Do not block the receive loop behind a congested camera upload. This
+					// keeps close frames and subsequent control messages readable.
+					void writeWebSocket(writer, JSON.stringify({
+						type: "heartbeat.pong",
+						protocol: PROTOCOL_VERSION,
+						pingId: message.pingId,
+					})).catch(error => trace(`Heartbeat pong error: ${error}\n`));
+				}
+				continue;
+			}
+			trace("WebSocket RX: ", value, "\n");
 			if (message.type !== "command")
 				continue;
 			try {
@@ -201,8 +215,8 @@ async function openWebSocket() {
 		const closedTask = socket.closed.then(
 			closeInfo => {
 				retireWebSocket(socket);
-				if (wasOpened && (closeInfo.closeCode === 1006)) {
-					trace("WebSocket transport failed; restarting device\n");
+				if (wasOpened) {
+					trace(`WebSocket closed (${closeInfo.closeCode}); restarting device\n`);
 					status.message("HUB LOST", "Restarting", "error", 1_000);
 					deviceConfig.restart();
 				}
@@ -218,6 +232,9 @@ async function openWebSocket() {
 		status.set("websocket", "CONNECTED", "ok");
 
 		const writer = writable.getWriter();
+		// This ESP-IDF timer runs outside the JS thread, so it can reboot even if
+		// a native TCP write blocks the event loop completely.
+		deviceConfig.startHeartbeatWatchdog(HEARTBEAT_WATCHDOG_MS);
 		const cameraStream = new CameraStream({
 			fps: 1,
 			onStateChanged(state, detail) {
@@ -230,7 +247,10 @@ async function openWebSocket() {
 				else if (state === "waiting")
 					status.set("camera", "WAITING FRAME", "pending");
 				else if (state === "frame") {
-					trace(`Camera frame ${detail.frameNumber}: ${detail.byteLength} bytes\n`);
+					// Serial output can block the JS thread when no USB monitor is reading it.
+					// Keep diagnostics useful without logging every frame at detail-view rates.
+					if ((detail.frameNumber % Math.max(10, cameraStream.fps * 10)) === 0)
+						trace(`Camera frame ${detail.frameNumber}: ${detail.byteLength} bytes\n`);
 					if ((detail.frameNumber % 5) === 0)
 						status.set("camera", `${cameraStream.fps}fps F${detail.frameNumber} ${detail.byteLength >> 10}KiB`, "ok");
 				}
@@ -238,7 +258,9 @@ async function openWebSocket() {
 					status.set("camera", "STOPPED", "error");
 			},
 		});
-		const readTask = readServerMessages(readable, writer, cameraStream, socket).catch(error => {
+		const readTask = readServerMessages(readable, writer, cameraStream, socket, () => {
+			deviceConfig.feedHeartbeatWatchdog();
+		}).catch(error => {
 			trace(`WebSocket read error: ${error}\n`);
 		});
 		const cameraTask = cameraStream.run(writer, () => webSocket === socket, {
@@ -265,6 +287,7 @@ async function openWebSocket() {
 		status.set("camera", "FAILED", "error");
 	}
 	finally {
+		deviceConfig.stopHeartbeatWatchdog();
 		socket?.close();
 		retireWebSocket(socket);
 		scheduleWebSocketRetry();

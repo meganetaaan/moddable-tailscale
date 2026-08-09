@@ -134,6 +134,18 @@ export default class DeviceConfig {
 		native.restart();
 	}
 
+	startHeartbeatWatchdog(timeout) {
+		native.watchdogStart(timeout);
+	}
+
+	feedHeartbeatWatchdog() {
+		native.watchdogFeed();
+	}
+
+	stopHeartbeatWatchdog() {
+		native.watchdogStop();
+	}
+
 	usbRead() {
 		return native.usbRead();
 	}

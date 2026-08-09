@@ -89,8 +89,9 @@ async function connectDevice(baseURL: string, deviceId: string) {
 
 async function withServer(
   run: (baseURL: string) => Promise<void>,
+  options: Parameters<typeof createCameraRegistry>[0] = {},
 ): Promise<void> {
-  const registry = createCameraRegistry({ log() {} });
+  const registry = createCameraRegistry({ ...options, log() {} });
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: 0, onListen() {} },
     registry.handler,
@@ -99,6 +100,7 @@ async function withServer(
   try {
     await run(`http://127.0.0.1:${address.port}`);
   } finally {
+    registry.close();
     await server.shutdown();
   }
 }
@@ -193,6 +195,90 @@ Deno.test("rejects a second device identity on the same socket", async () => {
       device.socket.close();
     }
   });
+});
+
+Deno.test("keeps responsive devices online and closes heartbeat timeouts", async () => {
+  await withServer(async (baseURL) => {
+    const device = await connectDevice(baseURL, "cores3-aabbcc000008");
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        const ping = await device.next((message) =>
+          message.type === "heartbeat.ping"
+        );
+        device.socket.send(JSON.stringify({
+          type: "heartbeat.pong",
+          protocol: 1,
+          pingId: ping.pingId,
+        }));
+      }
+
+      const summary = await fetch(`${baseURL}/api/devices`).then((response) =>
+        response.json()
+      );
+      assert(summary[0].online, "responsive heartbeat device went offline");
+      assert(
+        summary[0].heartbeat.lastPongAt &&
+          typeof summary[0].heartbeat.latencyMs === "number",
+        "heartbeat state was not recorded",
+      );
+
+      await device.next((message) => message.type === "heartbeat.ping");
+      const closed = new Promise<CloseEvent>((resolve) => {
+        device.socket.addEventListener("close", (event) => resolve(event), {
+          once: true,
+        });
+      });
+      const event = await Promise.race([
+        closed,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("heartbeat socket stayed open")),
+            500,
+          )
+        ),
+      ]);
+      assert(
+        event.code === 1013,
+        "heartbeat timeout used the wrong close code",
+      );
+    } finally {
+      device.socket.close();
+    }
+  }, { heartbeatIntervalMs: 10, heartbeatTimeoutMs: 30 });
+});
+
+Deno.test("treats camera frames as liveness while a pong is backpressured", async () => {
+  await withServer(async (baseURL) => {
+    const device = await connectDevice(baseURL, "cores3-aabbcc000009");
+    try {
+      await device.next((message) => message.type === "heartbeat.ping");
+      for (let index = 0; index < 4; index += 1) {
+        device.socket.send(new Uint8Array([0xff, 0xd8, index, 0xff, 0xd9]));
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+
+      const summary = await fetch(`${baseURL}/api/devices`).then((response) =>
+        response.json()
+      );
+      assert(summary[0].online, "active camera traffic was timed out");
+      assert(summary[0].frameCount === 4, "camera liveness frames were lost");
+
+      const closed = new Promise<CloseEvent>((resolve) => {
+        device.socket.addEventListener("close", (event) => resolve(event), {
+          once: true,
+        });
+      });
+      const event = await Promise.race([
+        closed,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("silent socket stayed open")), 150)
+        ),
+      ]);
+      assert(event.code === 1013, "silent socket used the wrong close code");
+    } finally {
+      device.socket.close();
+    }
+  }, { heartbeatIntervalMs: 10, heartbeatTimeoutMs: 30 });
 });
 
 Deno.test("switches 1fps -> 2fps -> 8fps from viewer demand", async () => {
