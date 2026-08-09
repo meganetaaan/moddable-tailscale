@@ -144,6 +144,8 @@ Denoは30秒のidle timeoutでRFC 6455 pingを送り、Moddableの下位WebSocke
 同じpayloadのpongを自動返信します。アプリケーション独自のheartbeat messageは使いません。
 CoreS3はcontrol ping受信または映像フレーム送信成功のたびにJS外のESP-IDF timer watchdogを
 feedし、25秒間どちらも進まなければ再起動して復旧します。
+MicroLinkのTCP送信は5秒の`SO_SNDTIMEO`を使い、送信windowが回復しない場合は
+`EAGAIN`を無期限再試行せずtransport errorとしてWebSocketの再接続へ進みます。
 WireGuard handshakeにはSNTP同期済みのwall clockを使い、再起動後の古いuptimeがreplay判定されるのを防ぎます。
 USBモニター未接続時の出力詰まりを避けるため、映像フレームとWireGuard DATAパケットのログは間引かれます。
 
