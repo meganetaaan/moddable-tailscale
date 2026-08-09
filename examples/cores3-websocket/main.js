@@ -2,10 +2,19 @@ import WiFi from "embedded:network/interface/wifi";
 import SNTP from "sntp";
 import Time from "time";
 import Timer from "timer";
-import WebSocketStream from "web/websocketstream";
+import WebSocketStream from "stackcam-websocket-stream";
 import Tailnet from "tailscale";
-import credentials from "credentials";
+import BLEProvisioning from "ble-provisioning";
+import CameraStream from "camera-stream";
+import DeviceConfig from "device-config";
+import ProvisioningProtocol from "provisioning-protocol";
 import StatusDisplay from "status-display";
+import USBProvisioning from "usb-provisioning";
+
+const PROTOCOL_VERSION = 1;
+const FIRMWARE_VERSION = "0.2.0";
+const CAPABILITIES = Object.freeze(["camera", "display", "provision.usb", "provision.ble"]);
+const WEBSOCKET_WRITE_TIMEOUT = 10_000;
 
 let tailnet;
 let webSocket;
@@ -16,11 +25,50 @@ let wifiConnectTimer;
 let wifiReconnectTimer;
 let webSocketRetryTimer;
 let starting = false;
+let bleProvisioning;
 const status = new StatusDisplay();
+const deviceConfig = new DeviceConfig();
 
-const wifiOptions = credentials.wifi.password
-	? {SSID: credentials.wifi.ssid, password: credentials.wifi.password}
-	: {SSID: credentials.wifi.ssid};
+const provisioningProtocol = new ProvisioningProtocol({
+	config: deviceConfig,
+	onChanged() {
+		status.message("CONFIG SAVED", "Restart to apply", "ok", 8_000);
+	},
+	onBLERequested() {
+		startBLEProvisioning();
+	},
+});
+
+new USBProvisioning({config: deviceConfig, protocol: provisioningProtocol});
+
+function startBLEProvisioning() {
+	if (bleProvisioning) {
+		bleProvisioning.extendWindow();
+		return;
+	}
+	bleProvisioning = new BLEProvisioning({
+		config: deviceConfig,
+		protocol: provisioningProtocol,
+		onStateChanged(state, detail) {
+			trace(`BLE provisioning: ${state}\n`);
+			if (state === "passkey")
+				status.message("BLE PASSKEY", detail.passkey, "info", 60_000);
+			else if (state === "advertising")
+				status.set("address", `BLE ${detail.name}`, "info");
+			else if (state === "authenticated")
+				status.message("BLE CONNECTED", "Send provisioning JSON", "ok", 5_000);
+			else if (state === "closed")
+				bleProvisioning = undefined;
+		},
+	});
+}
+
+startBLEProvisioning();
+status.message("DEVICE ID", deviceConfig.deviceId, "info", 2_000);
+
+const wifiOptions = deviceConfig.wifi.password
+	? {SSID: deviceConfig.wifi.ssid, password: deviceConfig.wifi.password}
+	: {SSID: deviceConfig.wifi.ssid};
 
 function waitWithTimeout(promise, milliseconds, message) {
 	return new Promise((resolve, reject) => {
@@ -39,50 +87,186 @@ function waitWithTimeout(promise, milliseconds, message) {
 }
 
 function scheduleWebSocketRetry() {
-	if (webSocketRetryTimer || !wifiConnected || (tailnet?.state !== "connected"))
+	if (webSocket || webSocketRetryTimer || !wifiConnected || (tailnet?.state !== "connected"))
 		return;
 	status.set("websocket", "RETRYING", "pending");
+	status.set("camera", "OFFLINE", "error");
+	trace("WebSocket retry scheduled\n");
 	webSocketRetryTimer = Timer.set(() => {
 		webSocketRetryTimer = undefined;
 		void openWebSocket();
 	}, 5_000);
 }
 
-async function openWebSocket() {
-	if (webSocket)
-		return;
-	trace(`WebSocket: ${credentials.websocketURL}\n`);
-	status.set("websocket", "CONNECTING", "pending");
-	status.set("echo", "WAITING", "pending");
-	let socket;
-	try {
-		socket = webSocket = new WebSocketStream(credentials.websocketURL, {ws: tailnet.ws});
-		const {readable, writable} = await waitWithTimeout(socket.opened, 65_000, "WebSocket connection timed out");
-		trace("WebSocket connected\n");
-		status.set("websocket", "CONNECTED", "ok");
-		const writer = writable.getWriter();
-		await writer.write("hello from Moddable over Tailscale");
-		status.set("echo", "SENT", "info");
-		writer.releaseLock();
+function retireWebSocket(socket) {
+	if (webSocket === socket)
+		webSocket = undefined;
+	scheduleWebSocketRetry();
+}
 
-		const reader = readable.getReader();
-		while (true) {
+function commandError(code, message) {
+	const error = new Error(message);
+	error.code = code;
+	return error;
+}
+
+function writeWebSocket(writer, value) {
+	return waitWithTimeout(writer.write(value), WEBSOCKET_WRITE_TIMEOUT, "WebSocket write timed out");
+}
+
+async function handleCommand(message, writer, cameraStream) {
+	if ((message.protocol !== PROTOCOL_VERSION) || (typeof message.commandId !== "string"))
+		throw commandError("invalid_command", "invalid command envelope");
+	const payload = message.payload ?? {};
+	let result;
+	if (message.command === "stream.set") {
+		const fps = cameraStream.setFPS(payload.fps);
+		result = {fps};
+	}
+	else if (message.command === "device.identify") {
+		const duration = Number.isInteger(payload.durationMs) ? payload.durationMs : 3_000;
+		if ((duration < 1) || (duration > 30_000))
+			throw commandError("invalid_payload", "durationMs must be between 1 and 30000");
+		status.identify(deviceConfig.deviceId, duration);
+		result = {displayed: true, durationMs: duration};
+	}
+	else if ((message.command === "tts.speak") || (message.command === "panTilt.move"))
+		throw commandError("not_supported", `${message.command} is not available in this firmware`);
+	else
+		throw commandError("unknown_command", `unknown command: ${message.command}`);
+
+	await writeWebSocket(writer, JSON.stringify({
+		type: "command.ack",
+		protocol: PROTOCOL_VERSION,
+		commandId: message.commandId,
+		command: message.command,
+		ok: true,
+		result,
+	}));
+}
+
+async function readServerMessages(readable, writer, cameraStream, socket) {
+	const reader = readable.getReader();
+	try {
+		while (webSocket === socket) {
 			const {done, value} = await reader.read();
 			if (done)
 				break;
-			trace("WebSocket RX: ", String(value), "\n");
-			status.set("echo", `OK: ${String(value)}`, "ok");
+			if (typeof value !== "string")
+				continue;
+			trace("WebSocket RX: ", value, "\n");
+			let message;
+			try {
+				message = JSON.parse(value);
+			}
+			catch {
+				continue;
+			}
+			if (message.type !== "command")
+				continue;
+			try {
+				await handleCommand(message, writer, cameraStream);
+			}
+			catch (error) {
+				await writeWebSocket(writer, JSON.stringify({
+					type: "command.ack",
+					protocol: PROTOCOL_VERSION,
+					commandId: String(message.commandId ?? ""),
+					command: String(message.command ?? ""),
+					ok: false,
+					error: {code: error.code ?? "command_failed", message: String(error.message ?? error)},
+				}));
+			}
 		}
+	}
+	finally {
+		reader.releaseLock();
+		retireWebSocket(socket);
+		socket.close();
+	}
+}
+
+async function openWebSocket() {
+	if (webSocket)
+		return;
+	trace(`WebSocket: ${deviceConfig.websocketURL}\n`);
+	status.set("websocket", "CONNECTING", "pending");
+	status.set("camera", "WAITING", "pending");
+	let socket;
+	let wasOpened = false;
+	try {
+		socket = webSocket = new WebSocketStream(deviceConfig.websocketURL, {ws: tailnet.ws});
+		// Observe closure immediately. The local WebSocketStream reports transport
+		// failures as close code 1006 to avoid XS's stuck Stream error state.
+		const closedTask = socket.closed.then(
+			closeInfo => {
+				retireWebSocket(socket);
+				if (wasOpened && (closeInfo.closeCode === 1006)) {
+					trace("WebSocket transport failed; restarting device\n");
+					status.message("HUB LOST", "Restarting", "error", 1_000);
+					deviceConfig.restart();
+				}
+			},
+			error => {
+				trace(`WebSocket closed with error: ${error}\n`);
+				retireWebSocket(socket);
+			},
+		);
+		const {readable, writable} = await waitWithTimeout(socket.opened, 65_000, "WebSocket connection timed out");
+		wasOpened = true;
+		trace("WebSocket connected\n");
+		status.set("websocket", "CONNECTED", "ok");
+
+		const writer = writable.getWriter();
+		const cameraStream = new CameraStream({
+			fps: 1,
+			onStateChanged(state, detail) {
+				if (state === "starting")
+					status.set("camera", "STARTING", "pending");
+				else if (state === "streaming")
+					status.set("camera", `${detail.width}x${detail.height} @ ${detail.fps}fps`, "ok");
+				else if (state === "rate")
+					status.set("camera", `${cameraStream.width}x${cameraStream.height} @ ${detail.fps}fps`, "ok");
+				else if (state === "waiting")
+					status.set("camera", "WAITING FRAME", "pending");
+				else if (state === "frame") {
+					trace(`Camera frame ${detail.frameNumber}: ${detail.byteLength} bytes\n`);
+					if ((detail.frameNumber % 5) === 0)
+						status.set("camera", `${cameraStream.fps}fps F${detail.frameNumber} ${detail.byteLength >> 10}KiB`, "ok");
+				}
+				else if (state === "stopped")
+					status.set("camera", "STOPPED", "error");
+			},
+		});
+		const readTask = readServerMessages(readable, writer, cameraStream, socket).catch(error => {
+			trace(`WebSocket read error: ${error}\n`);
+		});
+		const cameraTask = cameraStream.run(writer, () => webSocket === socket, {
+				type: "device.hello",
+				protocol: PROTOCOL_VERSION,
+				deviceId: deviceConfig.deviceId,
+				name: deviceConfig.deviceName,
+				model: "m5stack-cores3",
+				firmware: FIRMWARE_VERSION,
+				capabilities: CAPABILITIES,
+			}).catch(error => {
+				trace(`Camera stream error: ${error}\n`);
+				status.set("camera", "FAILED", "error");
+			});
+
+		// A transport error can leave an in-flight WritableStream operation
+		// pending in the SDK. Reconnect as soon as any side observes closure;
+		// cameraTask remains the sole owner of the retired writer until GC.
+		await Promise.race([closedTask, readTask, cameraTask]);
 	}
 	catch (error) {
 		trace(`WebSocket error: ${error}\n`);
 		status.set("websocket", "ERROR", "error");
-		status.set("echo", "FAILED", "error");
+		status.set("camera", "FAILED", "error");
 	}
 	finally {
 		socket?.close();
-		if (webSocket === socket)
-			webSocket = undefined;
+		retireWebSocket(socket);
 		scheduleWebSocketRetry();
 	}
 }
@@ -94,7 +278,7 @@ async function startTailnet() {
 	try {
 		if (!tailnet) {
 			tailnet = new Tailnet({
-				...credentials.tailscale,
+				...deviceConfig.tailscale,
 				onStateChanged(state) {
 					trace(`Tailnet state: ${state}\n`);
 					status.set("tailnet", String(state).toUpperCase(), state === "connected" ? "ok" : "pending");
@@ -183,7 +367,7 @@ function scanAndConnectWiFi() {
 	try {
 		wifi.scan({
 			onFound(accessPoint) {
-				if ((accessPoint.SSID === credentials.wifi.ssid) && !found) {
+				if ((accessPoint.SSID === deviceConfig.wifi.ssid) && !found) {
 					found = true;
 					trace(`Configured Wi-Fi found: channel ${accessPoint.channel}, RSSI ${accessPoint.RSSI}\n`);
 					status.set("wifi", `FOUND ${accessPoint.RSSI} dBm`, "info");
@@ -237,7 +421,7 @@ wifi = new WiFi({
 			status.set("wifi", "DISCONNECTED", "error");
 			status.set("tailnet", "OFFLINE", "error");
 			status.set("websocket", "OFFLINE", "error");
-			status.set("echo", "OFFLINE", "error");
+			status.set("camera", "OFFLINE", "error");
 			if (webSocketRetryTimer) {
 				Timer.clear(webSocketRetryTimer);
 				webSocketRetryTimer = undefined;

@@ -1,13 +1,14 @@
 import Poco from "commodetto/Poco";
 import parseBMF from "commodetto/parseBMF";
 import Resource from "Resource";
+import Timer from "timer";
 
 const rowDefinitions = [
 	["wifi", "Wi-Fi"],
 	["tailnet", "Tailnet"],
 	["address", "Address"],
 	["websocket", "WebSocket"],
-	["echo", "Echo"],
+	["camera", "Camera"],
 ];
 
 export default class StatusDisplay {
@@ -47,10 +48,34 @@ export default class StatusDisplay {
 			return;
 		row.text = text;
 		row.tone = tone;
+		if (this.overlay)
+			return;
 		this.drawRow(rowDefinitions.findIndex(([name]) => name === key));
 	}
 
+	message(title, detail, tone = "info", duration = 10_000) {
+		if (this.overlayTimer)
+			Timer.clear(this.overlayTimer);
+		this.overlay = {title: String(title), detail: String(detail), tone};
+		this.drawOverlay();
+		if (duration > 0) {
+			this.overlayTimer = Timer.set(() => {
+				this.overlayTimer = undefined;
+				this.overlay = undefined;
+				this.draw();
+			}, duration);
+		}
+	}
+
+	identify(deviceId, duration = 3_000) {
+		this.message("IDENTIFY", deviceId, "info", duration);
+	}
+
 	draw() {
+		if (this.overlay) {
+			this.drawOverlay();
+			return;
+		}
 		const render = this.render;
 		const colors = this.colors;
 		render.begin();
@@ -60,6 +85,21 @@ export default class StatusDisplay {
 		render.end();
 		for (let index = 0; index < rowDefinitions.length; index++)
 			this.drawRow(index);
+	}
+
+	drawOverlay() {
+		const render = this.render;
+		const colors = this.colors;
+		const background = colors[this.overlay.tone] ?? colors.info;
+		const title = this.fitText(this.overlay.title, render.width - 24);
+		const detail = this.fitText(this.overlay.detail, render.width - 24);
+		const titleWidth = render.getTextWidth(title, this.font);
+		const detailWidth = render.getTextWidth(detail, this.font);
+		render.begin();
+		render.fillRectangle(background, 0, 0, render.width, render.height);
+		render.drawText(title, this.font, colors.text, (render.width - titleWidth) >> 1, 78);
+		render.drawText(detail, this.font, colors.text, (render.width - detailWidth) >> 1, 122);
+		render.end();
 	}
 
 	drawRow(index) {
