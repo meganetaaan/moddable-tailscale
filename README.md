@@ -265,9 +265,16 @@ DERPのTLSはESP-IDF証明書バンドルで検証しますが、WireGuard内の
 
 ```sh
 ./scripts/verify.sh
-deno fmt --check tools/echo-server.ts tools/camera-server.ts tools/camera-server.test.ts
-deno check tools/echo-server.ts tools/camera-server.ts tools/camera-server.test.ts
-deno test --allow-net tools/camera-server.test.ts
+deno fmt --check tools/echo-server.ts tools/camera-server.ts tools/camera-server.test.ts tools/camera-soak.ts tools/camera-soak.test.ts
+deno check tools/echo-server.ts tools/camera-server.ts tools/camera-server.test.ts tools/camera-soak.ts tools/camera-soak.test.ts
+deno test --allow-net tools/camera-server.test.ts tools/camera-soak.test.ts
+```
+
+実機を使わず、2台の仮想カメラを詳細表示の8fpsで10分間流すsoak testは次で実行します。
+進捗は30秒ごとにJSONで出力され、ONLINE状態、要求fps、フレーム配送率、予期しない切断を検証します。
+
+```sh
+deno run --allow-net tools/camera-soak.ts --duration-seconds=600 --devices=2 --fps=8
 ```
 
 固定ベクトルは、Tailscale公式`controlbase`と同じbig-endian counterをChaCha20-Poly1305 nonceへ配置して検証します。
