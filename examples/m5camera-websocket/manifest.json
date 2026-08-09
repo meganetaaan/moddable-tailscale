@@ -1,0 +1,85 @@
+{
+	"build": {
+		"ESP32_SUBCLASS": "esp32",
+		"SDKCONFIGPATH": "./sdkconfig-m5camera"
+	},
+	"creation": {
+		"static": 0,
+		"chunk": {
+			"initial": 131072,
+			"incremental": 0
+		},
+		"heap": {
+			"initial": 8192,
+			"incremental": 0
+		},
+		"stack": 2048
+	},
+	"include": [
+		"$(MODDABLE)/examples/manifest_base.json",
+		"$(MODDABLE)/examples/manifest_net.json",
+		"$(MODDABLE)/modules/io/imagein/camera/manifest.json",
+		"$(MODDABLE)/modules/web/streams/websocket/manifest.json",
+		"../../manifest.json"
+	],
+	"config": {
+		"stackcam": {
+			"model": "m5stack-m5camera",
+			"devicePrefix": "m5camera",
+			"capabilities": ["camera", "provision.usb"]
+		}
+	},
+	"defines": {
+		"xs": {
+			"abortHook": 1
+		},
+		"stackcam": {
+			"uart_provisioning": 1
+		},
+		"camera": {
+			"powerdown": -1,
+			"reset": 15,
+			"xclk": 27,
+			"pclk": 21,
+			"href": 26,
+			"vsync": 25,
+			"scl": 23,
+			"sda": 22,
+			"i2c_port": 0,
+			"xclk_freq_hz": 20000000,
+			"jpeg_quality": 12,
+			"d0": 32,
+			"d1": 35,
+			"d2": 34,
+			"d3": 5,
+			"d4": 39,
+			"d5": 18,
+			"d6": 36,
+			"d7": 19
+		}
+	},
+	"modules": {
+		"*": "../cores3-websocket/main",
+		"ble-provisioning": "./disabled-ble-provisioning",
+		"camera-stream": "./camera-stream",
+		"credentials": "../cores3-websocket/credentials",
+		"device-config": "../cores3-websocket/device-config",
+		"device-config-native": "../cores3-websocket/native/device-config-native",
+		"device-config/idf/*": "$(IDF_PATH)/components/esp_driver_uart/include/driver/uart.h",
+		"m5camera-config-native/*": "../cores3-websocket/native/device-config.c",
+		"provisioning-protocol": "../cores3-websocket/provisioning-protocol",
+		"status-display": "./status-display",
+		"stackcam-websocket-stream": "../cores3-websocket/websocket-stream",
+		"usb-provisioning": "../cores3-websocket/usb-provisioning"
+	},
+	"platforms": {
+		"esp32": {
+			"dependency": [
+				{ "idf": "esp_driver_uart" }
+			]
+		},
+		"...": {
+			"error": "This example requires the original ESP32-based M5Camera"
+		}
+	}
+}

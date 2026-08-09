@@ -1,4 +1,5 @@
 import WiFi from "embedded:network/interface/wifi";
+import config from "mc/config";
 import SNTP from "sntp";
 import Time from "time";
 import Timer from "timer";
@@ -13,7 +14,11 @@ import USBProvisioning from "usb-provisioning";
 
 const PROTOCOL_VERSION = 1;
 const FIRMWARE_VERSION = "0.2.0";
-const CAPABILITIES = Object.freeze(["camera", "display", "provision.usb", "provision.ble"]);
+const STACKCAM_CONFIG = config.stackcam ?? {};
+const DEVICE_MODEL = STACKCAM_CONFIG.model ?? "m5stack-cores3";
+const CAPABILITIES = Object.freeze(STACKCAM_CONFIG.capabilities ?? ["camera", "display", "provision.usb", "provision.ble"]);
+const BLE_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.ble");
+const USB_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.usb");
 const WEBSOCKET_WRITE_TIMEOUT = 10_000;
 const HEARTBEAT_WATCHDOG_MS = 25_000;
 
@@ -28,7 +33,7 @@ let webSocketRetryTimer;
 let starting = false;
 let bleProvisioning;
 const status = new StatusDisplay();
-const deviceConfig = new DeviceConfig();
+const deviceConfig = new DeviceConfig({devicePrefix: STACKCAM_CONFIG.devicePrefix ?? "cores3"});
 
 const provisioningProtocol = new ProvisioningProtocol({
 	config: deviceConfig,
@@ -36,11 +41,15 @@ const provisioningProtocol = new ProvisioningProtocol({
 		status.message("CONFIG SAVED", "Restart to apply", "ok", 8_000);
 	},
 	onBLERequested() {
-		startBLEProvisioning();
+		if (BLE_PROVISIONING_ENABLED)
+			startBLEProvisioning();
+		else
+			status.message("BLE DISABLED", "Use USB serial", "error", 5_000);
 	},
 });
 
-new USBProvisioning({config: deviceConfig, protocol: provisioningProtocol});
+if (USB_PROVISIONING_ENABLED)
+	new USBProvisioning({config: deviceConfig, protocol: provisioningProtocol});
 
 function startBLEProvisioning() {
 	if (bleProvisioning) {
@@ -64,7 +73,8 @@ function startBLEProvisioning() {
 	});
 }
 
-startBLEProvisioning();
+if (BLE_PROVISIONING_ENABLED)
+	startBLEProvisioning();
 status.message("DEVICE ID", deviceConfig.deviceId, "info", 2_000);
 
 const wifiOptions = deviceConfig.wifi.password
@@ -261,7 +271,7 @@ async function openWebSocket() {
 				protocol: PROTOCOL_VERSION,
 				deviceId: deviceConfig.deviceId,
 				name: deviceConfig.deviceName,
-				model: "m5stack-cores3",
+				model: DEVICE_MODEL,
 				firmware: FIRMWARE_VERSION,
 				capabilities: CAPABILITIES,
 			}).catch(error => {

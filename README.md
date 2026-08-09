@@ -1,6 +1,6 @@
 # moddable-tailscale
 
-ESP32-S3上のModdableアプリケーションをTailnetの1ノードとして動かすための実験的な統合です。
+ESP32/ESP32-S3上のModdableアプリケーションをTailnetの1ノードとして動かすための実験的な統合です。
 
 TailscaleプロトコルはXS JavaScriptで再実装せず、MicroLinkをESP-IDFネイティブ層へ固定バージョンで組み込みます。
 JavaScript側には、送信TCPをWHATWG Streams、WebSocketStream用ECMA-419ソケット、双方向UDPとして公開します。
@@ -28,8 +28,8 @@ TCPの`listen()`と`accept()`、複数TCP接続、複数UDPソケット、IPv6�
 
 - Moddable SDK 9.0.0
 - ESP-IDF v6.0.2
-- ESP32-S3
-- 8 MB PSRAMを持つM5Stack CoreS3
+- ESP32-S3と8 MB PSRAMを持つM5Stack CoreS3
+- ESP32と4 MB PSRAMを持つM5Stack M5Camera（U017）
 - Tailscale auth keyを発行できるTailnet
 
 Moddable 9.0.0が要求するESP-IDFの版は`v6.0.2`です。
@@ -52,13 +52,14 @@ cp examples/cores3-websocket/credentials.example.js \
   examples/cores3-websocket/credentials.js
 ```
 
-`credentials.js`へWi-Fiと、CoreS3用tagを付けたauth keyを設定します。
+`credentials.js`へWi-Fiと、カメラ端末用tagを付けたauth keyを設定します。
 この値は初回起動用のfallbackで、同じfirmwareを複数台へ書き込めます。
-各個体のIDはeFuse MACから`cores3-xxxxxxxxxxxx`、Tailnet上の名前は
-`stackcam-xxxxxx`として自動生成されます。このファイルは`.gitignore`の対象です。
+各個体のIDはeFuse MACからCoreS3では`cores3-xxxxxxxxxxxx`、M5Cameraでは
+`m5camera-xxxxxxxxxxxx`、Tailnet上の名前はいずれも`stackcam-xxxxxx`として
+自動生成されます。このファイルは`.gitignore`の対象です。
 
 中央PCのTailscaleマシン名は`stackchan-hub`にします。MagicDNSを有効にすると、
-CoreS3は固定URL `ws://stackchan-hub:8080/camera`へ接続するため、中央PCの
+各カメラ端末は固定URL `ws://stackchan-hub:8080/camera`へ接続するため、中央PCの
 100.xアドレスが変わってもfirmwareの再設定は不要です。Tailnet policyでは、たとえば
 [`tag:stackchan-camera`](https://tailscale.com/docs/features/tags)のownerを管理者に限定し、
 CoreS3用auth keyへこのtagを付与して、
@@ -157,6 +158,31 @@ MicroLinkのTCP送信は5秒の`SO_SNDTIMEO`を使い、送信windowが回復し
 `EAGAIN`を無期限再試行せずtransport errorとしてWebSocketの再接続へ進みます。
 WireGuard handshakeにはSNTP同期済みのwall clockを使い、再起動後の古いuptimeがreplay判定されるのを防ぎます。
 USBモニター未接続時の出力詰まりを避けるため、映像フレームとWireGuard DATAパケットのログは間引かれます。
+
+### M5Cameraターゲット
+
+M5Camera（U017）はCoreS3と同じcamera hub protocol、Tailnet transport、設定保存を使いますが、
+初代ESP32、OV2640、4 MB flash向けの別firmware imageです。同じsourceと
+`credentials.js` fallbackから複数台へ書き込めますが、CoreS3用binaryそのものは書き込めません。
+
+OV2640から320x240 JPEGを直接取得するためsoftware再encodeは行わず、Hubからの要求に応じて
+1〜8 fpsで送信します。画面がないため状態はserial traceへ出力し、BLE provisioningは含めません。
+CP2104のUSB serial（UART0、115200 baud）からCoreS3と同じJSON provisioning protocolを使用できます。
+
+```sh
+./scripts/build-m5camera-example.sh release
+```
+
+書き込みまで行う場合はM5CameraのUSB portを接続して次を実行します。
+
+```sh
+cd examples/m5camera-websocket
+mcconfig -m -p esp32
+```
+
+release firmwareへ個体設定を書き込む場合は、後述の`provision-usb.ps1`または
+`provision-camera.ps1`へCP2104のCOM portを指定します。debug buildではUART0をModdable debuggerが
+使用するため、このserial provisioning経路は無効です。
 
 ### 個体設定
 
