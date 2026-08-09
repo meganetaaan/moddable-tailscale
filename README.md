@@ -65,14 +65,14 @@ CoreS3向けサンプルをビルドして書き込みます。
 
 ```sh
 cd examples/cores3-websocket
-mcconfig -d -m -p esp32
+mcconfig -d -m -p esp32/m5stack_cores3
 ```
 
-サンプルはネットワーク経路だけを検証するheadless構成です。
-`-p esp32/m5stack_cores3`ではなく`-p esp32`を指定し、サンプルのmanifestから`ESP32_SUBCLASS=esp32s3`と専用`SDKCONFIGPATH`を適用します。
+サンプルはCoreS3の画面へWi-Fi、Tailnet、WebSocket、echoの状態を表示します。
+CoreS3固有の電源・I2C・ディスプレイ設定を使うため、`-p esp32/m5stack_cores3`を指定します。
 
 既存のｽﾀｯｸﾁｬﾝへ統合するときは、ルートの`manifest.json`をアプリケーションmanifestからincludeしてください。
-また、[`sdkconfig.defaults`](examples/cores3-websocket/sdkconfig/sdkconfig.defaults)のPSRAM、socket数、TCP buffer、IP fragmentation、証明書バンドル設定を、最終的に有効になる`SDKCONFIGPATH`へマージしてください。
+また、[`sdkconfig.defaults`](examples/cores3-websocket/sdkconfig/sdkconfig.defaults)のPSRAM、socket数、TCP buffer、IP fragmentation、PPP、証明書バンドル設定を、CoreS3ターゲットで最終的に有効になる`SDKCONFIGPATH`へマージしてください。
 
 ## JavaScript API
 

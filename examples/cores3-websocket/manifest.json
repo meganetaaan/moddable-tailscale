@@ -19,12 +19,21 @@
 	"include": [
 		"$(MODDABLE)/examples/manifest_base.json",
 		"$(MODDABLE)/examples/manifest_net.json",
+		"$(MODDABLE)/examples/manifest_commodetto.json",
 		"$(MODDABLE)/modules/web/streams/websocket/manifest.json",
 		"../../manifest.json"
 	],
+	"config": {
+		"startupSound": null,
+		"brightness": 100
+	},
 	"modules": {
 		"*": "./main",
-		"credentials": "./credentials"
+		"credentials": "./credentials",
+		"status-display": "./status-display"
+	},
+	"resources": {
+		"*-mask": "$(MODDABLE)/examples/assets/fonts/OpenSans-Semibold-18"
 	},
 	"platforms": {
 		"esp32": {},
