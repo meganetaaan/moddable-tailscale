@@ -16,7 +16,10 @@ const PROTOCOL_VERSION = 1;
 const FIRMWARE_VERSION = "0.2.0";
 const STACKCAM_CONFIG = config.stackcam ?? {};
 const DEVICE_MODEL = STACKCAM_CONFIG.model ?? "m5stack-cores3";
-const CAPABILITIES = Object.freeze(STACKCAM_CONFIG.capabilities ?? ["camera", "display", "provision.usb", "provision.ble"]);
+// Values from mc/config can live in the read-only XS archive. JSON.stringify
+// needs a writable instance while it marks objects for circularity checks, so
+// copy manifest-provided arrays into RAM before including them in device.hello.
+const CAPABILITIES = Object.freeze(Array.from(STACKCAM_CONFIG.capabilities ?? ["camera", "display", "provision.usb", "provision.ble"]));
 const BLE_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.ble");
 const USB_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.usb");
 const WEBSOCKET_WRITE_TIMEOUT = 10_000;
