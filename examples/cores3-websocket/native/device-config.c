@@ -1,10 +1,17 @@
 #include "xsmc.h"
 #include "mc.xs.h"
+#include "mc.defines.h"
 
 #include "esp_mac.h"
+#include "esp_event.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "usb_serial_jtag.h"
+#include "esp_wifi.h"
+#if MODDEF_STACKCAM_UART_PROVISIONING
+	#include "driver/uart.h"
+#else
+	#include "usb_serial_jtag.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -20,7 +27,9 @@
 #define USB_READ_MAX 256
 
 static bool gNVSInitialized;
-static bool gUSBInitialized;
+static bool gProvisioningSerialInitialized;
+static bool gWiFiDisconnectHandlerRegistered;
+static volatile uint32_t gWiFiDisconnectReason;
 static esp_timer_handle_t gHeartbeatWatchdog;
 static uint32_t gHeartbeatWatchdogTicks;
 static volatile uint32_t gHeartbeatWatchdogRemaining;
@@ -32,11 +41,35 @@ static void heartbeat_watchdog_callback(void *context) {
 		esp_restart();
 }
 
+static void wifi_disconnect_handler(void *context, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+	(void)context;
+	(void)event_base;
+	(void)event_id;
+	const wifi_event_sta_disconnected_t *event = event_data;
+	__atomic_store_n(&gWiFiDisconnectReason, event->reason, __ATOMIC_RELAXED);
+}
+
 static bool ensure_usb(void) {
 #ifdef mxDebug
 	return false;
 #else
-	if (!gUSBInitialized) {
+	if (!gProvisioningSerialInitialized) {
+	#if MODDEF_STACKCAM_UART_PROVISIONING
+		if (!uart_is_driver_installed(UART_NUM_0)) {
+			const uart_config_t config = {
+				.baud_rate = 115200,
+				.data_bits = UART_DATA_8_BITS,
+				.parity = UART_PARITY_DISABLE,
+				.stop_bits = UART_STOP_BITS_1,
+				.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+				.source_clk = UART_SCLK_DEFAULT,
+			};
+			if (uart_param_config(UART_NUM_0, &config) != ESP_OK)
+				return false;
+			if (uart_driver_install(UART_NUM_0, 1024, 1024, 0, NULL, 0) != ESP_OK)
+				return false;
+		}
+	#else
 		usb_serial_jtag_driver_config_t config = {
 			.rx_buffer_size = 1024,
 			.tx_buffer_size = 1024,
@@ -44,7 +77,8 @@ static bool ensure_usb(void) {
 		esp_err_t err = usb_serial_jtag_driver_install(&config);
 		if ((err != ESP_OK) && (err != ESP_ERR_INVALID_STATE))
 			return false;
-		gUSBInitialized = true;
+	#endif
+		gProvisioningSerialInitialized = true;
 	}
 	return true;
 #endif
@@ -153,6 +187,24 @@ void xs_device_config_restart(xsMachine *the) {
 	esp_restart();
 }
 
+void xs_device_config_wifi_prepare(xsMachine *the) {
+	esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+	if (err != ESP_OK)
+		xsUnknownError("cannot disable Wi-Fi power save");
+	if (!gWiFiDisconnectHandlerRegistered) {
+		err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_disconnect_handler, NULL);
+		if (err != ESP_OK)
+			xsUnknownError("cannot register Wi-Fi diagnostics");
+		gWiFiDisconnectHandlerRegistered = true;
+	}
+}
+
+void xs_device_config_wifi_disconnect_reason(xsMachine *the) {
+	uint32_t reason = __atomic_exchange_n(&gWiFiDisconnectReason, 0, __ATOMIC_RELAXED);
+	if (reason)
+		xsmcSetInteger(xsResult, reason);
+}
+
 void xs_device_config_watchdog_start(xsMachine *the) {
 	int timeout = xsmcToInteger(xsArg(0));
 	esp_err_t err;
@@ -190,9 +242,14 @@ void xs_device_config_watchdog_stop(xsMachine *the) {
 
 void xs_device_config_usb_read(xsMachine *the) {
 	char value[USB_READ_MAX + 1];
-	int count = ensure_usb()
-		? usb_serial_jtag_read_bytes(value, USB_READ_MAX, 0)
-		: 0;
+	int count = 0;
+	if (ensure_usb()) {
+	#if MODDEF_STACKCAM_UART_PROVISIONING
+		count = uart_read_bytes(UART_NUM_0, value, USB_READ_MAX, 0);
+	#else
+		count = usb_serial_jtag_read_bytes(value, USB_READ_MAX, 0);
+	#endif
+	}
 	if (count) {
 		value[count] = 0;
 		xsmcSetStringBuffer(xsResult, value, count);
@@ -201,6 +258,11 @@ void xs_device_config_usb_read(xsMachine *the) {
 
 void xs_device_config_usb_write(xsMachine *the) {
 	const char *value = xsmcToString(xsArg(0));
-	if (ensure_usb())
+	if (ensure_usb()) {
+	#if MODDEF_STACKCAM_UART_PROVISIONING
+		uart_write_bytes(UART_NUM_0, value, strlen(value));
+	#else
 		usb_serial_jtag_write_bytes(value, strlen(value), pdMS_TO_TICKS(100));
+	#endif
+	}
 }

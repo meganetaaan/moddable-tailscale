@@ -53,6 +53,7 @@ fi
 
 node -e 'for (const file of process.argv.slice(1)) JSON.parse(require("fs").readFileSync(file))' \
 	"${PROJECT_ROOT}/manifest.json" \
-	"${PROJECT_ROOT}/examples/cores3-websocket/manifest.json"
+	"${PROJECT_ROOT}/examples/cores3-websocket/manifest.json" \
+	"${PROJECT_ROOT}/examples/m5camera-websocket/manifest.json"
 
 echo "Repository verification: OK"

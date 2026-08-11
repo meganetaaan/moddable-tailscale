@@ -54,9 +54,9 @@ function defaults() {
 }
 
 export default class DeviceConfig {
-	constructor() {
+	constructor(options = {}) {
 		this.mac = mac;
-		this.deviceId = `cores3-${mac}`;
+		this.deviceId = `${options.devicePrefix ?? "cores3"}-${mac}`;
 		this.deviceName = `stackcam-${mac.slice(-6)}`;
 		this.persisted = false;
 		this.value = defaults();
@@ -132,6 +132,14 @@ export default class DeviceConfig {
 
 	restart() {
 		native.restart();
+	}
+
+	prepareWiFi() {
+		native.wifiPrepare();
+	}
+
+	takeWiFiDisconnectReason() {
+		return native.wifiDisconnectReason();
 	}
 
 	startHeartbeatWatchdog(timeout) {

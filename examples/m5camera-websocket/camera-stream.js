@@ -1,12 +1,9 @@
 import Camera from "embedded:io/image/in/camera";
-import Bitmap from "commodetto/Bitmap";
-import encodeJPEG from "jpeg-encoder";
 import Timer from "timer";
 
-const DEFAULT_WIDTH = 240;
-const DEFAULT_HEIGHT = 176;
+const DEFAULT_WIDTH = 320;
+const DEFAULT_HEIGHT = 240;
 const DEFAULT_FPS = 1;
-const DEFAULT_JPEG_QUALITY = 50;
 const WRITE_TIMEOUT = 30_000;
 
 function writeWithTimeout(socket, value) {
@@ -39,7 +36,6 @@ export default class CameraStream {
 		this.height = options.height ?? DEFAULT_HEIGHT;
 		this.fps = options.fps ?? DEFAULT_FPS;
 		this.interval = Math.round(1_000 / this.fps);
-		this.quality = options.quality ?? DEFAULT_JPEG_QUALITY;
 		this.onStateChanged = options.onStateChanged;
 		this.onFrameSent = options.onFrameSent;
 		this.camera = undefined;
@@ -99,7 +95,7 @@ export default class CameraStream {
 			let timer;
 			let writeTimer;
 			let settled = false;
-			let pendingJPEG;
+			let pendingFrame;
 			let pendingInterval;
 			let pendingByteLength;
 
@@ -145,10 +141,12 @@ export default class CameraStream {
 			};
 
 			const onWriteComplete = () => {
+				const frame = pendingFrame;
 				const interval = pendingInterval;
 				const byteLength = pendingByteLength;
-				pendingJPEG = undefined;
+				pendingFrame = undefined;
 				clearWriteTimer();
+				frame?.close?.();
 				if (settled)
 					return;
 				this.framesSent += 1;
@@ -157,8 +155,10 @@ export default class CameraStream {
 			};
 
 			const onWriteError = error => {
-				pendingJPEG = undefined;
+				const frame = pendingFrame;
+				pendingFrame = undefined;
 				clearWriteTimer();
+				frame?.close?.();
 				finish(error);
 			};
 
@@ -181,21 +181,16 @@ export default class CameraStream {
 					return;
 				}
 
-				let jpeg;
-				try {
-					jpeg = encodeJPEG(frame, this.width, this.height, this.quality);
-				}
-				catch (error) {
-					finish(error);
+				const bytes = new Uint8Array(frame);
+				const byteLength = bytes.byteLength;
+				if ((bytes.byteLength < 4) || (bytes[0] !== 0xFF) || (bytes[1] !== 0xD8) ||
+					(bytes[bytes.byteLength - 2] !== 0xFF) || (bytes[bytes.byteLength - 1] !== 0xD9)) {
+					frame.close?.();
+					finish(new Error("OV2640 returned an invalid JPEG"));
 					return;
 				}
-				finally {
-					frame.close?.();
-				}
 
-				const bytes = new Uint8Array(jpeg);
-				const byteLength = bytes.byteLength;
-				pendingJPEG = jpeg;
+				pendingFrame = frame;
 				pendingInterval = interval;
 				pendingByteLength = byteLength;
 				writeTimer = Timer.set(onWriteTimeout, WRITE_TIMEOUT);
@@ -203,9 +198,9 @@ export default class CameraStream {
 					socket.send(bytes, sendCallbacks);
 				}
 				catch (error) {
-					pendingJPEG = undefined;
+					pendingFrame = undefined;
 					clearWriteTimer();
-					jpeg = undefined;
+					frame.close?.();
 					finish(error);
 				}
 			};
@@ -221,8 +216,7 @@ export default class CameraStream {
 		const camera = new Camera({
 			width: this.width,
 			height: this.height,
-			// CoreS3's GC0308 emits raw pixels, so JPEG is encoded in software.
-			imageType: Bitmap.RGB565LE,
+			imageType: "jpeg",
 			format: "buffer/disposable",
 		});
 		this.camera = camera;
