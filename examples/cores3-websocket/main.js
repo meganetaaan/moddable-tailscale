@@ -146,7 +146,7 @@ async function handleCommand(message, writer, cameraStream) {
 	}));
 }
 
-async function readServerMessages(readable, writer, cameraStream, socket, onHeartbeat) {
+async function readServerMessages(readable, writer, cameraStream, socket) {
 	const reader = readable.getReader();
 	try {
 		while (webSocket === socket) {
@@ -160,19 +160,6 @@ async function readServerMessages(readable, writer, cameraStream, socket, onHear
 				message = JSON.parse(value);
 			}
 			catch {
-				continue;
-			}
-			if (message.type === "heartbeat.ping") {
-				if ((message.protocol === PROTOCOL_VERSION) && (typeof message.pingId === "string")) {
-					onHeartbeat();
-					// Do not block the receive loop behind a congested camera upload. This
-					// keeps close frames and subsequent control messages readable.
-					void writeWebSocket(writer, JSON.stringify({
-						type: "heartbeat.pong",
-						protocol: PROTOCOL_VERSION,
-						pingId: message.pingId,
-					})).catch(error => trace(`Heartbeat pong error: ${error}\n`));
-				}
 				continue;
 			}
 			trace("WebSocket RX: ", value, "\n");
@@ -209,7 +196,12 @@ async function openWebSocket() {
 	let socket;
 	let wasOpened = false;
 	try {
-		socket = webSocket = new WebSocketStream(deviceConfig.websocketURL, {ws: tailnet.ws});
+		socket = webSocket = new WebSocketStream(deviceConfig.websocketURL, {
+			ws: tailnet.ws,
+			onPing() {
+				deviceConfig.feedHeartbeatWatchdog();
+			},
+		});
 		// Observe closure immediately. The local WebSocketStream reports transport
 		// failures as close code 1006 to avoid XS's stuck Stream error state.
 		const closedTask = socket.closed.then(
@@ -247,6 +239,9 @@ async function openWebSocket() {
 				else if (state === "waiting")
 					status.set("camera", "WAITING FRAME", "pending");
 				else if (state === "frame") {
+					// A completed frame proves that the JS and TCP send paths are still
+					// making progress even when Deno does not need to send an idle ping.
+					deviceConfig.feedHeartbeatWatchdog();
 					// Serial output can block the JS thread when no USB monitor is reading it.
 					// Keep diagnostics useful without logging every frame at detail-view rates.
 					if ((detail.frameNumber % Math.max(10, cameraStream.fps * 10)) === 0)
@@ -258,9 +253,7 @@ async function openWebSocket() {
 					status.set("camera", "STOPPED", "error");
 			},
 		});
-		const readTask = readServerMessages(readable, writer, cameraStream, socket, () => {
-			deviceConfig.feedHeartbeatWatchdog();
-		}).catch(error => {
+		const readTask = readServerMessages(readable, writer, cameraStream, socket).catch(error => {
 			trace(`WebSocket read error: ${error}\n`);
 		});
 		const cameraTask = cameraStream.run(writer, () => webSocket === socket, {

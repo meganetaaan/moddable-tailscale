@@ -140,10 +140,10 @@ mcconfig -m -p esp32/m5stack_cores3
 CoreS3固有の電源・I2C・ディスプレイ設定を使うため、`-p esp32/m5stack_cores3`を指定します。
 配信確立後にhubとのWebSocketが終了した場合は、ESP32版WebSocketStreamの停止回避として
 CoreS3を明示的に再起動し、Wi-Fi/Tailnet登録から自動復旧します。初回接続失敗は再起動せず再試行します。
-Tailnet上の分割送信と競合するDenoのcontrol-frame pingは無効化し、hubが10秒ごとに
-`heartbeat.ping`を送り、CoreS3が`heartbeat.pong`を返します。30秒応答がなければ切断します。
-CoreS3はpong送信を待たず制御メッセージの受信を続け、25秒pingを受信できなければ
-JS外のESP-IDF timer watchdogが再起動して復旧します。
+Denoは30秒のidle timeoutでRFC 6455 pingを送り、Moddableの下位WebSocketClientが
+同じpayloadのpongを自動返信します。アプリケーション独自のheartbeat messageは使いません。
+CoreS3はcontrol ping受信または映像フレーム送信成功のたびにJS外のESP-IDF timer watchdogを
+feedし、25秒間どちらも進まなければ再起動して復旧します。
 WireGuard handshakeにはSNTP同期済みのwall clockを使い、再起動後の古いuptimeがreplay判定されるのを防ぎます。
 USBモニター未接続時の出力詰まりを避けるため、映像フレームとWireGuard DATAパケットのログは間引かれます。
 

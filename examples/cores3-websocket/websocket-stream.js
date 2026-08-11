@@ -31,6 +31,7 @@ class WebSocketStream {
 
 	constructor(href, options) {
 		let protocol;
+		const onPing = options?.onPing;
 		const url = new URL(href);
 		const scheme = url.protocol;
 		let port;
@@ -78,6 +79,7 @@ class WebSocketStream {
 					case this.#client.constructor.ping:
 						// WebSocketClient automatically queues the RFC 6455 pong with
 						// the same payload after this control callback returns.
+						onPing?.();
 						break;
 					case this.#client.constructor.pong:
 						break;
