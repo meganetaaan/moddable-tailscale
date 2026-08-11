@@ -18,6 +18,7 @@
 	"include": [
 		"$(MODDABLE)/examples/manifest_base.json",
 		"$(MODDABLE)/examples/manifest_net.json",
+		"$(MODDABLE)/modules/io/digital/manifest.json",
 		"$(MODDABLE)/modules/io/imagein/camera/manifest.json",
 		"$(MODDABLE)/modules/web/streams/websocket/manifest.json",
 		"../../manifest.json"

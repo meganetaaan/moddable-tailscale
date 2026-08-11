@@ -166,7 +166,10 @@ M5Camera（U017）はCoreS3と同じcamera hub protocol、Tailnet transport、�
 `credentials.js` fallbackから複数台へ書き込めますが、CoreS3用binaryそのものは書き込めません。
 
 OV2640から320x240 JPEGを直接取得するためsoftware再encodeは行わず、Hubからの要求に応じて
-1〜8 fpsで送信します。画面がないため状態はserial traceへ出力し、BLE provisioningは含めません。
+1〜8 fpsで送信します。画面がないため状態はserial traceと基板上のGPIO14 LEDへ出力し、
+BLE provisioningは含めません。LEDは接続処理中に500 ms間隔で点滅し、Wi-Fi、Tailnet、
+WebSocket、映像送信がすべて確立すると点灯します。エラーまたは切断時は125 ms間隔で点滅し、
+`device.identify`を受信したときも指定時間だけ125 ms間隔で点滅してから現在状態へ戻ります。
 CP2104のUSB serial（UART0、115200 baud）からCoreS3と同じJSON provisioning protocolを使用できます。
 
 ```sh
@@ -199,6 +202,12 @@ $env:STACKCHAN_AUTH_KEY = "tskey-auth-..."
 
 `get`はSSID、auth key/passwordの設定有無、device ID、hub URLだけを返し、秘密値は返しません。
 `clear`でNVS設定を削除してfirmware内fallbackへ戻し、`restart`で再起動できます。
+
+Windows版ChromeまたはEdgeで`http://localhost:8080/provision`を開くと、同じ設定を
+Web Serialだけで完結できます。「USBシリアルで接続」を押してM5CameraのCP2104 COM portを
+選択してください。WSLへUSB接続中、書き込み中、またはserial monitor起動中はWindowsブラウザーから
+COM portを開けないため、先にそれらを終了またはdetachします。空欄のWi-Fi passwordと
+Tailscale auth keyは既存値を保持し、ブラウザーには秘密値そのものを返しません。
 
 端末ごとに再利用不可のtagged auth keyを自動発行して、そのままUSB設定する場合は、Tailscale
 管理画面でOAuth clientを作成します。`auth_keys`のwrite scopeと

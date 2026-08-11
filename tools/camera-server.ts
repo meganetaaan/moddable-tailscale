@@ -560,7 +560,7 @@ export function createCameraRegistry(
   async function handler(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/provision") {
-      return new Response(BLE_PROVISION_HTML, {
+      return new Response(PROVISION_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -939,7 +939,7 @@ const INDEX_HTML = `<!doctype html>
   </style>
 </head>
 <body>
-  <header><h1>Stack-chan Private Camera Hub</h1><div><a class="back" href="/provision">BLE setup</a> <span id="summary" class="summary">読込中…</span></div></header>
+  <header><h1>Stack-chan Private Camera Hub</h1><div><a class="back" href="/provision">Device setup</a> <span id="summary" class="summary">読込中…</span></div></header>
   <main id="app"></main>
 <script>
   const app = document.querySelector('#app');
@@ -1048,31 +1048,37 @@ const INDEX_HTML = `<!doctype html>
   }
 </script></body></html>`;
 
-const BLE_PROVISION_HTML = `<!doctype html>
+const PROVISION_HTML = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>StackCam BLE provisioning</title>
+<title>StackCam device setup</title>
 <style>
   :root { color-scheme: dark; font-family: system-ui, sans-serif; }
   body { margin: 0; background: #071019; color: #edf6fb; }
-  main { width: min(620px, 92vw); margin: 28px auto; }
+  main { width: min(680px, 92vw); margin: 28px auto; }
   section { padding: 20px; border: 1px solid #29465c; border-radius: 14px; background: #0d1924; }
   label { display: block; margin-top: 14px; color: #afc4d2; }
   input { width: 100%; box-sizing: border-box; margin-top: 5px; padding: 10px; color: inherit;
     background: #071019; border: 1px solid #365d77; border-radius: 8px; }
   button, a { display: inline-block; margin: 14px 6px 0 0; padding: 10px 13px; color: inherit;
     background: #164566; border: 1px solid #4382aa; border-radius: 8px; text-decoration: none; cursor: pointer; }
+  button:disabled { cursor: default; opacity: .45; }
   pre { min-height: 110px; padding: 12px; overflow: auto; white-space: pre-wrap; background: #03080c;
     border: 1px solid #20394c; border-radius: 8px; color: #9ed9bd; }
-  .hint { color: #9bb1c0; }
+  .hint, .device { color: #9bb1c0; }
+  .transport { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .transport strong { margin: 14px 0 0 6px; }
+  small { display: block; margin-top: 6px; color: #8fa8b8; }
 </style></head><body><main>
-<a href="/">← Camera hub</a><h1>StackCam BLE provisioning</h1>
-<p class="hint">Windowsの「Bluetoothとデバイス」で先に <code>StackCam-…</code> を追加し、CoreS3画面の6桁番号でペアリングしてください。その後、Codex内蔵ブラウザではなくWindows版ChromeまたはEdgeでこのページを開きます。</p>
+<a href="/">← Camera hub</a><h1>StackCam device setup</h1>
+<p class="hint">M5CameraはUSBシリアル、CoreS3はUSBシリアルまたはBLEで設定できます。Web SerialはWindows版ChromeまたはEdgeで <code>http://localhost:8080/provision</code> を開いて使用してください。</p>
+<p class="hint">BLEではWindowsの「Bluetoothとデバイス」で先に <code>StackCam-…</code> を追加し、CoreS3画面の6桁番号でペアリングします。</p>
 <section>
-  <button id="connect">BLEで接続</button><strong id="state">未接続</strong>
+  <div class="transport"><button id="serial-connect">USBシリアルで接続</button><button id="ble-connect">BLEで接続</button><button id="disconnect" disabled>切断</button><strong id="state">未接続</strong></div>
+  <p id="device" class="device">デバイス情報は接続後に表示されます。</p>
   <label>Wi-Fi SSID<input id="ssid" autocomplete="off"></label>
-  <label>Wi-Fi password<input id="password" type="password" autocomplete="new-password"></label>
-  <label>Tailscale auth key<input id="auth" type="password" autocomplete="off"></label>
+  <label>Wi-Fi password<input id="password" type="password" autocomplete="new-password"><small>空欄の場合、現在の設定を変更しません。</small></label>
+  <label>Tailscale auth key<input id="auth" type="password" autocomplete="off"><small>空欄の場合、現在の設定を変更しません。</small></label>
   <label>Hub URL<input id="hub" value="ws://stackchan-hub:8080/camera"></label>
   <button id="save" disabled>設定を保存</button><button id="read" disabled>状態を取得</button>
   <button id="restart" disabled>再起動</button><button id="clear" disabled>NVS設定を消去</button>
@@ -1082,50 +1088,170 @@ const BLE_PROVISION_HTML = `<!doctype html>
   const SERVICE = '7a910001-6b8a-4d1f-9a3d-535441434b43';
   const RX = '7a910002-6b8a-4d1f-9a3d-535441434b43';
   const TX = '7a910003-6b8a-4d1f-9a3d-535441434b43';
-  const encoder = new TextEncoder(); const decoder = new TextDecoder();
+  const PREFIX = '@stackchan ';
+  const encoder = new TextEncoder();
   const log = document.querySelector('#log'); const state = document.querySelector('#state');
-  let rx; let buffer = '';
+  const serialConnect = document.querySelector('#serial-connect'); const bleConnect = document.querySelector('#ble-connect');
+  const disconnect = document.querySelector('#disconnect'); const deviceInfo = document.querySelector('#device');
+  const ssid = document.querySelector('#ssid'); const password = document.querySelector('#password');
+  const auth = document.querySelector('#auth'); const hub = document.querySelector('#hub');
+  let transport; let decoder = new TextDecoder(); let buffer = '';
+  let bleDevice; let bleRX;
+  let serialPort; let serialReader; let serialWriter; let serialReadTask;
+
   function append(value) { log.textContent += '\\n' + value; log.scrollTop = log.scrollHeight; }
+  function errorText(error) { return error && error.message ? error.message : String(error); }
   function enabled(value) { for (const id of ['save','read','restart','clear']) document.querySelector('#'+id).disabled = !value; }
-  async function send(message) {
-    if (!rx) throw new Error('BLE未接続です');
-    const line = JSON.stringify({...message, requestId:crypto.randomUUID()}) + '\\n';
-    const bytes = encoder.encode(line);
-    for (let offset = 0; offset < bytes.length; offset += 180) {
-      await rx.writeValueWithResponse(bytes.slice(offset, offset + 180));
+  function connecting(value) {
+    state.textContent = value; serialConnect.disabled = true; bleConnect.disabled = true; disconnect.disabled = true; enabled(false);
+  }
+  function connected(value) {
+    state.textContent = value; serialConnect.disabled = true; bleConnect.disabled = true; disconnect.disabled = false; enabled(true);
+  }
+  function disconnected(value = '未接続') {
+    transport = undefined; state.textContent = value; serialConnect.disabled = false; bleConnect.disabled = false; disconnect.disabled = true; enabled(false);
+  }
+  function resetParser() { decoder = new TextDecoder(); buffer = ''; }
+  function updateConfig(message) {
+    const config = message && message.type === 'provision.ack' ? message.config : undefined;
+    if (!config) return;
+    ssid.value = config.wifi && config.wifi.ssid ? config.wifi.ssid : '';
+    hub.value = config.hubURL || 'ws://stackchan-hub:8080/camera';
+    password.value = ''; auth.value = '';
+    password.placeholder = config.wifi && config.wifi.passwordSet ? '設定済み' : '未設定';
+    auth.placeholder = config.tailscale && config.tailscale.authKeySet ? '設定済み' : '未設定';
+    deviceInfo.textContent = (config.deviceName || 'StackCam') + ' · ' + (config.deviceId || '') + ' · ' + (config.persisted ? 'NVS設定' : 'ファームウェア初期値');
+  }
+  function acceptChunk(chunk) {
+    buffer += decoder.decode(chunk, {stream:true});
+    let end;
+    while ((end = buffer.indexOf('\\n')) >= 0) {
+      let line = buffer.slice(0, end).trim(); buffer = buffer.slice(end + 1);
+      const marker = line.indexOf(PREFIX);
+      if (marker >= 0) line = line.slice(marker + PREFIX.length).trim();
+      else if (!line.startsWith('{')) continue;
+      if (!line) continue;
+      append(line);
+      try { updateConfig(JSON.parse(line)); } catch {}
     }
   }
-  document.querySelector('#connect').onclick = async () => {
+  async function send(message) {
+    const line = JSON.stringify({...message, requestId:crypto.randomUUID()}) + '\\n';
+    if (transport === 'serial') {
+      if (!serialWriter) throw new Error('USBシリアル未接続です');
+      await serialWriter.write(encoder.encode(PREFIX + line));
+      return;
+    }
+    if (transport === 'ble') {
+      if (!bleRX) throw new Error('BLE未接続です');
+      const bytes = encoder.encode(line);
+      for (let offset = 0; offset < bytes.length; offset += 180)
+        await bleRX.writeValueWithResponse(bytes.slice(offset, offset + 180));
+      return;
+    }
+    throw new Error('デバイス未接続です');
+  }
+  async function readSerial(port) {
+    const reader = port.readable.getReader(); serialReader = reader;
     try {
-      if (!navigator.bluetooth)
-        throw new Error('Web Bluetooth非対応です。Windows版ChromeまたはEdgeでlocalhostを開いてください');
-      const device = await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
-      state.textContent = '接続中…';
-      const server = await device.gatt.connect(); const service = await server.getPrimaryService(SERVICE);
-      rx = await service.getCharacteristic(RX); const tx = await service.getCharacteristic(TX);
-      await tx.startNotifications();
-      tx.addEventListener('characteristicvaluechanged', event => {
-        buffer += decoder.decode(event.target.value, {stream:true});
-        let end; while ((end = buffer.indexOf('\\n')) >= 0) {
-          const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); if (line) append(line);
-        }
-      });
-      device.addEventListener('gattserverdisconnected', () => { rx = null; enabled(false); state.textContent = '切断'; });
-      state.textContent = device.name + ' 接続済み'; enabled(true); await send({type:'provision.get'});
+      while (serialPort === port) {
+        const result = await reader.read();
+        if (result.done) break;
+        if (result.value) acceptChunk(result.value);
+      }
     } catch (error) {
-      append('ERROR: ' + error.message);
-      if (/GATT Server is disconnected|retrieve services/i.test(error.message))
-        append('HINT: Windowsの「Bluetoothとデバイス」でStackCamを先にペアリングし、CoreS3を再起動してから再接続してください。');
-      state.textContent = '接続失敗';
+      if (serialPort === port) append('ERROR: USBシリアル受信: ' + errorText(error));
+    } finally {
+      if (serialReader === reader) serialReader = undefined;
+      reader.releaseLock();
+      if (serialPort === port) {
+        serialPort = undefined;
+        try { serialWriter && serialWriter.releaseLock(); } catch {}
+        serialWriter = undefined; serialReadTask = undefined; disconnected('切断');
+      }
+    }
+  }
+  async function closeSerial() {
+    const port = serialPort;
+    if (!port) return;
+    serialPort = undefined;
+    try { if (serialReader) await serialReader.cancel(); } catch {}
+    try { if (serialReadTask) await serialReadTask; } catch {}
+    try { serialWriter && serialWriter.releaseLock(); } catch {}
+    serialReader = undefined; serialWriter = undefined; serialReadTask = undefined;
+    try { await port.close(); } catch {}
+  }
+  async function closeBLE() {
+    const device = bleDevice; bleDevice = undefined; bleRX = undefined;
+    if (device && device.gatt && device.gatt.connected) device.gatt.disconnect();
+  }
+  serialConnect.onclick = async () => {
+    try {
+      if (!isSecureContext) throw new Error('Web SerialにはlocalhostまたはHTTPSが必要です');
+      if (!navigator.serial) throw new Error('Web Serial非対応です。Windows版ChromeまたはEdgeを使用してください');
+      const port = await navigator.serial.requestPort();
+      connecting('USBシリアル接続中…'); resetParser();
+      await port.open({baudRate:115200, dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:4096});
+      serialPort = port;
+      if (!port.readable || !port.writable) throw new Error('シリアル入出力を開けません');
+      try { await port.setSignals({dataTerminalReady:false, requestToSend:false}); } catch (error) { append('WARN: 制御信号を設定できません: ' + errorText(error)); }
+      serialWriter = port.writable.getWriter(); serialReadTask = readSerial(port); transport = 'serial';
+      const info = port.getInfo ? port.getInfo() : {};
+      const ids = info.usbVendorId === undefined ? '' : ' (' + info.usbVendorId.toString(16).padStart(4,'0') + ':' + info.usbProductId.toString(16).padStart(4,'0') + ')';
+      connected('USBシリアル接続済み' + ids); append('USBシリアルを115200 baudで開きました。');
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      await send({type:'provision.get'});
+    } catch (error) {
+      await closeSerial();
+      if (error && error.name === 'NotFoundError') append('USBデバイスの選択をキャンセルしました。');
+      else {
+        append('ERROR: ' + errorText(error));
+        append('HINT: WSL、シリアルモニター、書き込みツールがCOMポートを使用していないか確認してください。');
+      }
+      disconnected('接続失敗');
     }
   };
-  document.querySelector('#save').onclick = () => send({type:'provision.set', config:{
-    wifi:{ssid:document.querySelector('#ssid').value, password:document.querySelector('#password').value},
-    tailscale:{authKey:document.querySelector('#auth').value}, hubURL:document.querySelector('#hub').value
-  }}).catch(error => append('ERROR: '+error.message));
-  document.querySelector('#read').onclick = () => send({type:'provision.get'}).catch(error => append('ERROR: '+error.message));
-  document.querySelector('#restart').onclick = () => send({type:'provision.restart'}).catch(error => append('ERROR: '+error.message));
-  document.querySelector('#clear').onclick = () => send({type:'provision.clear'}).catch(error => append('ERROR: '+error.message));
+  bleConnect.onclick = async () => {
+    try {
+      if (!navigator.bluetooth) throw new Error('Web Bluetooth非対応です。Windows版ChromeまたはEdgeでlocalhostを開いてください');
+      const device = await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+      connecting('BLE接続中…'); resetParser(); bleDevice = device;
+      const server = await device.gatt.connect(); const service = await server.getPrimaryService(SERVICE);
+      bleRX = await service.getCharacteristic(RX); const tx = await service.getCharacteristic(TX);
+      await tx.startNotifications();
+      tx.addEventListener('characteristicvaluechanged', event => acceptChunk(new Uint8Array(event.target.value.buffer, event.target.value.byteOffset, event.target.value.byteLength)));
+      device.addEventListener('gattserverdisconnected', () => {
+        if (bleDevice === device) { bleDevice = undefined; bleRX = undefined; disconnected('切断'); }
+      });
+      transport = 'ble'; connected((device.name || 'StackCam') + ' BLE接続済み'); await send({type:'provision.get'});
+    } catch (error) {
+      await closeBLE(); append('ERROR: ' + errorText(error));
+      if (/GATT Server is disconnected|retrieve services/i.test(errorText(error)))
+        append('HINT: Windowsの「Bluetoothとデバイス」でStackCamを先にペアリングし、CoreS3を再起動してから再接続してください。');
+      disconnected('接続失敗');
+    }
+  };
+  disconnect.onclick = async () => {
+    const active = transport; transport = undefined; enabled(false);
+    if (active === 'serial') await closeSerial();
+    else if (active === 'ble') await closeBLE();
+    disconnected();
+  };
+  document.querySelector('#save').onclick = async () => {
+    try {
+      const wifi = {ssid:ssid.value}; const tailscale = {}; const config = {wifi, hubURL:hub.value};
+      if (password.value) wifi.password = password.value;
+      if (auth.value) { tailscale.authKey = auth.value; config.tailscale = tailscale; }
+      await send({type:'provision.set', config});
+    } catch (error) { append('ERROR: ' + errorText(error)); }
+  };
+  document.querySelector('#read').onclick = () => send({type:'provision.get'}).catch(error => append('ERROR: ' + errorText(error)));
+  document.querySelector('#restart').onclick = () => send({type:'provision.restart'}).catch(error => append('ERROR: ' + errorText(error)));
+  document.querySelector('#clear').onclick = () => {
+    if (confirm('保存済みNVS設定を消去し、ファームウェア初期値へ戻しますか？'))
+      send({type:'provision.clear'}).catch(error => append('ERROR: ' + errorText(error)));
+  };
+  if (!isSecureContext || !navigator.serial) serialConnect.title = 'Web SerialにはWindows版Chrome/EdgeのlocalhostまたはHTTPSが必要です';
 </script></main></body></html>`;
 
 function parsePort(value: string | undefined): number {
