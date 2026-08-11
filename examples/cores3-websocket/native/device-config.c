@@ -3,8 +3,10 @@
 #include "mc.defines.h"
 
 #include "esp_mac.h"
+#include "esp_event.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #if MODDEF_STACKCAM_UART_PROVISIONING
 	#include "driver/uart.h"
 #else
@@ -26,6 +28,8 @@
 
 static bool gNVSInitialized;
 static bool gProvisioningSerialInitialized;
+static bool gWiFiDisconnectHandlerRegistered;
+static volatile uint32_t gWiFiDisconnectReason;
 static esp_timer_handle_t gHeartbeatWatchdog;
 static uint32_t gHeartbeatWatchdogTicks;
 static volatile uint32_t gHeartbeatWatchdogRemaining;
@@ -35,6 +39,14 @@ static void heartbeat_watchdog_callback(void *context) {
 	uint32_t remaining = __atomic_load_n(&gHeartbeatWatchdogRemaining, __ATOMIC_RELAXED);
 	if (remaining && (__atomic_sub_fetch(&gHeartbeatWatchdogRemaining, 1, __ATOMIC_RELAXED) == 0))
 		esp_restart();
+}
+
+static void wifi_disconnect_handler(void *context, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+	(void)context;
+	(void)event_base;
+	(void)event_id;
+	const wifi_event_sta_disconnected_t *event = event_data;
+	__atomic_store_n(&gWiFiDisconnectReason, event->reason, __ATOMIC_RELAXED);
 }
 
 static bool ensure_usb(void) {
@@ -173,6 +185,24 @@ void xs_device_config_clear(xsMachine *the) {
 
 void xs_device_config_restart(xsMachine *the) {
 	esp_restart();
+}
+
+void xs_device_config_wifi_prepare(xsMachine *the) {
+	esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+	if (err != ESP_OK)
+		xsUnknownError("cannot disable Wi-Fi power save");
+	if (!gWiFiDisconnectHandlerRegistered) {
+		err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_disconnect_handler, NULL);
+		if (err != ESP_OK)
+			xsUnknownError("cannot register Wi-Fi diagnostics");
+		gWiFiDisconnectHandlerRegistered = true;
+	}
+}
+
+void xs_device_config_wifi_disconnect_reason(xsMachine *the) {
+	uint32_t reason = __atomic_exchange_n(&gWiFiDisconnectReason, 0, __ATOMIC_RELAXED);
+	if (reason)
+		xsmcSetInteger(xsResult, reason);
 }
 
 void xs_device_config_watchdog_start(xsMachine *the) {

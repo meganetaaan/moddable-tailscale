@@ -13,7 +13,7 @@ import StatusDisplay from "status-display";
 import USBProvisioning from "usb-provisioning";
 
 const PROTOCOL_VERSION = 1;
-const FIRMWARE_VERSION = "0.2.0";
+const FIRMWARE_VERSION = "0.2.1";
 const STACKCAM_CONFIG = config.stackcam ?? {};
 const DEVICE_MODEL = STACKCAM_CONFIG.model ?? "m5stack-cores3";
 // Values from mc/config can live in the read-only XS archive. JSON.stringify
@@ -23,7 +23,7 @@ const CAPABILITIES = Object.freeze(Array.from(STACKCAM_CONFIG.capabilities ?? ["
 const BLE_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.ble");
 const USB_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.usb");
 const WEBSOCKET_WRITE_TIMEOUT = 10_000;
-const HEARTBEAT_WATCHDOG_MS = 25_000;
+const HEARTBEAT_WATCHDOG_MS = 75_000;
 
 let tailnet;
 let webSocket;
@@ -33,10 +33,41 @@ let wifiConnected = false;
 let wifiConnectTimer;
 let wifiReconnectTimer;
 let webSocketRetryTimer;
+let tailnetRecoveryTimer;
 let starting = false;
+let tailnetNeedsRebind = false;
+let heartbeatWatchdogSocket;
+let cameraSessionTask;
 let bleProvisioning;
 const status = new StatusDisplay();
 const deviceConfig = new DeviceConfig({devicePrefix: STACKCAM_CONFIG.devicePrefix ?? "cores3"});
+const cameraStream = new CameraStream({
+	fps: 1,
+	onStateChanged(state, detail) {
+		if (state === "starting")
+			status.set("camera", "STARTING", "pending");
+		else if (state === "streaming")
+			status.set("camera", `${detail.width}x${detail.height} @ ${detail.fps}fps`, "ok");
+		else if (state === "rate")
+			status.set("camera", `${cameraStream.width}x${cameraStream.height} @ ${detail.fps}fps`, "ok");
+		else if (state === "waiting")
+			status.set("camera", "WAITING FRAME", "pending");
+		else if (state === "frame") {
+			// A completed frame proves that the JS and TCP send paths are still
+			// making progress even when Deno does not need to send an idle ping.
+			if (heartbeatWatchdogSocket)
+				deviceConfig.feedHeartbeatWatchdog();
+			// Serial output can block the JS thread when no USB monitor is reading it.
+			// Keep diagnostics useful without logging every frame at detail-view rates.
+			if ((detail.frameNumber % Math.max(10, cameraStream.fps * 10)) === 0)
+				trace(`Camera frame ${detail.frameNumber}: ${detail.byteLength} bytes\n`);
+			if ((detail.frameNumber % 5) === 0)
+				status.set("camera", `${cameraStream.fps}fps F${detail.frameNumber} ${detail.byteLength >> 10}KiB`, "ok");
+		}
+		else if (state === "stopped")
+			status.set("camera", "STOPPED", "error");
+	},
+});
 
 const provisioningProtocol = new ProvisioningProtocol({
 	config: deviceConfig,
@@ -116,6 +147,15 @@ function retireWebSocket(socket) {
 	if (webSocket === socket)
 		webSocket = undefined;
 	scheduleWebSocketRetry();
+}
+
+function scheduleTailnetRecovery(delay = 0) {
+	if (tailnetRecoveryTimer || !wifiConnected)
+		return;
+	tailnetRecoveryTimer = Timer.set(() => {
+		tailnetRecoveryTimer = undefined;
+		void startTailnet();
+	}, delay);
 }
 
 function commandError(code, message) {
@@ -212,7 +252,8 @@ async function openWebSocket() {
 		socket = webSocket = new WebSocketStream(deviceConfig.websocketURL, {
 			ws: tailnet.ws,
 			onPing() {
-				deviceConfig.feedHeartbeatWatchdog();
+				if (heartbeatWatchdogSocket === socket)
+					deviceConfig.feedHeartbeatWatchdog();
 			},
 		});
 		// Observe closure immediately. The local WebSocketStream reports transport
@@ -221,9 +262,8 @@ async function openWebSocket() {
 			closeInfo => {
 				retireWebSocket(socket);
 				if (wasOpened) {
-					trace(`WebSocket closed (${closeInfo.closeCode}); restarting device\n`);
-					status.message("HUB LOST", "Restarting", "error", 1_000);
-					deviceConfig.restart();
+					trace(`WebSocket closed (${closeInfo.closeCode}); reconnecting\n`);
+					status.message("HUB LOST", "Reconnecting", "error", 2_000);
 				}
 			},
 			error => {
@@ -239,48 +279,31 @@ async function openWebSocket() {
 		const writer = writable.getWriter();
 		// This ESP-IDF timer runs outside the JS thread, so it can reboot even if
 		// a native TCP write blocks the event loop completely.
+		heartbeatWatchdogSocket = socket;
 		deviceConfig.startHeartbeatWatchdog(HEARTBEAT_WATCHDOG_MS);
-		const cameraStream = new CameraStream({
-			fps: 1,
-			onStateChanged(state, detail) {
-				if (state === "starting")
-					status.set("camera", "STARTING", "pending");
-				else if (state === "streaming")
-					status.set("camera", `${detail.width}x${detail.height} @ ${detail.fps}fps`, "ok");
-				else if (state === "rate")
-					status.set("camera", `${cameraStream.width}x${cameraStream.height} @ ${detail.fps}fps`, "ok");
-				else if (state === "waiting")
-					status.set("camera", "WAITING FRAME", "pending");
-				else if (state === "frame") {
-					// A completed frame proves that the JS and TCP send paths are still
-					// making progress even when Deno does not need to send an idle ping.
-					deviceConfig.feedHeartbeatWatchdog();
-					// Serial output can block the JS thread when no USB monitor is reading it.
-					// Keep diagnostics useful without logging every frame at detail-view rates.
-					if ((detail.frameNumber % Math.max(10, cameraStream.fps * 10)) === 0)
-						trace(`Camera frame ${detail.frameNumber}: ${detail.byteLength} bytes\n`);
-					if ((detail.frameNumber % 5) === 0)
-						status.set("camera", `${cameraStream.fps}fps F${detail.frameNumber} ${detail.byteLength >> 10}KiB`, "ok");
-				}
-				else if (state === "stopped")
-					status.set("camera", "STOPPED", "error");
-			},
-		});
+		if (cameraSessionTask)
+			await waitWithTimeout(cameraSessionTask, 5_000, "Previous camera session did not stop");
 		const readTask = readServerMessages(readable, writer, cameraStream, socket).catch(error => {
 			trace(`WebSocket read error: ${error}\n`);
 		});
 		const cameraTask = cameraStream.run(writer, () => webSocket === socket, {
-				type: "device.hello",
-				protocol: PROTOCOL_VERSION,
-				deviceId: deviceConfig.deviceId,
-				name: deviceConfig.deviceName,
-				model: DEVICE_MODEL,
-				firmware: FIRMWARE_VERSION,
-				capabilities: CAPABILITIES,
-			}).catch(error => {
-				trace(`Camera stream error: ${error}\n`);
-				status.set("camera", "FAILED", "error");
-			});
+			type: "device.hello",
+			protocol: PROTOCOL_VERSION,
+			deviceId: deviceConfig.deviceId,
+			name: deviceConfig.deviceName,
+			model: DEVICE_MODEL,
+			firmware: FIRMWARE_VERSION,
+			capabilities: CAPABILITIES,
+		}, {keepCameraOpen: true}).catch(error => {
+			trace(`Camera stream error: ${error}\n`);
+			status.set("camera", "FAILED", "error");
+		}).then(() => {
+			if (cameraSessionTask === cameraTask)
+				cameraSessionTask = undefined;
+		}).catch(error => {
+			trace(`Camera session cleanup error: ${error}\n`);
+		});
+		cameraSessionTask = cameraTask;
 
 		// A transport error can leave an in-flight WritableStream operation
 		// pending in the SDK. Reconnect as soon as any side observes closure;
@@ -293,7 +316,10 @@ async function openWebSocket() {
 		status.set("camera", "FAILED", "error");
 	}
 	finally {
-		deviceConfig.stopHeartbeatWatchdog();
+		if (heartbeatWatchdogSocket === socket) {
+			heartbeatWatchdogSocket = undefined;
+			deviceConfig.stopHeartbeatWatchdog();
+		}
 		socket?.close();
 		retireWebSocket(socket);
 		scheduleWebSocketRetry();
@@ -301,7 +327,7 @@ async function openWebSocket() {
 }
 
 async function startTailnet() {
-	if (starting)
+	if (starting || !wifiConnected)
 		return;
 	starting = true;
 	try {
@@ -311,6 +337,8 @@ async function startTailnet() {
 				onStateChanged(state) {
 					trace(`Tailnet state: ${state}\n`);
 					status.set("tailnet", String(state).toUpperCase(), state === "connected" ? "ok" : "pending");
+					if ((state === "connected") && wifiConnected && !webSocket)
+						scheduleTailnetRecovery();
 				},
 				onError(error) {
 					trace(`Tailnet error: ${error.message}\n`);
@@ -324,14 +352,25 @@ async function startTailnet() {
 			trace(`Tailnet peers: ${peers.map(peer => `${peer.address}/${peer.online ? "online" : "offline"}/${peer.direct ? "direct" : "relay"}`).join(", ")}\n`);
 			status.set("tailnet", `CONNECTED (${peers.length})`, "ok");
 		}
-		else
+		else if (tailnetNeedsRebind) {
+			if (tailnet.state !== "connected") {
+				status.set("tailnet", "WAITING TO REBIND", "pending");
+				return;
+			}
+			tailnetNeedsRebind = false;
 			await tailnet.rebind();
+		}
+		else if (tailnet.state !== "connected") {
+			status.set("tailnet", "WAITING TO RECOVER", "pending");
+			return;
+		}
 		await new Promise(resolve => Timer.set(resolve, 2_000));
 		void openWebSocket();
 	}
 	catch (error) {
 		trace(`Tailnet startup failed: ${error}\n`);
 		status.set("tailnet", "START FAILED", "error");
+		scheduleTailnetRecovery(5_000);
 	}
 	finally {
 		starting = false;
@@ -446,7 +485,8 @@ wifi = new WiFi({
 		else if (connection <= 200) {
 			clearWiFiConnectTimer();
 			wifiConnected = false;
-			trace("Wi-Fi disconnected\n");
+			const reason = deviceConfig.takeWiFiDisconnectReason();
+			trace(`Wi-Fi disconnected${reason ? ` (reason ${reason})` : ""}\n`);
 			status.set("wifi", "DISCONNECTED", "error");
 			status.set("tailnet", "OFFLINE", "error");
 			status.set("websocket", "OFFLINE", "error");
@@ -455,11 +495,20 @@ wifi = new WiFi({
 				Timer.clear(webSocketRetryTimer);
 				webSocketRetryTimer = undefined;
 			}
-			webSocket?.close();
-			webSocket = undefined;
+			tailnetNeedsRebind = !!tailnet;
+			if (tailnetRecoveryTimer) {
+				Timer.clear(tailnetRecoveryTimer);
+				tailnetRecoveryTimer = undefined;
+			}
+			const socket = webSocket;
+			if (socket) {
+				retireWebSocket(socket);
+				socket.close();
+			}
 			scheduleWiFiReconnect();
 		}
 	},
 });
 
+deviceConfig.prepareWiFi();
 scanAndConnectWiFi();

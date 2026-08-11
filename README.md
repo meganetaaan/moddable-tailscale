@@ -148,12 +148,14 @@ mcconfig -m -p esp32/m5stack_cores3
 
 サンプルはCoreS3の画面へWi-Fi、Tailnet、WebSocket、カメラ送信の状態を表示します。
 CoreS3固有の電源・I2C・ディスプレイ設定を使うため、`-p esp32/m5stack_cores3`を指定します。
-配信確立後にhubとのWebSocketが終了した場合は、ESP32版WebSocketStreamの停止回避として
-CoreS3を明示的に再起動し、Wi-Fi/Tailnet登録から自動復旧します。初回接続失敗は再起動せず再試行します。
+hubとのWebSocketが終了した場合は本体を再起動せず、Wi-Fi/TailnetとWebSocketを段階的に再接続します。
+カメラは接続をまたいで維持し、送信待ち中も古いframeをcloseして最新frameへ更新するため、
+hub再起動後もnative camera bufferを詰まらせず配信を再開できます。
 Denoは30秒のidle timeoutでRFC 6455 pingを送り、Moddableの下位WebSocketClientが
 同じpayloadのpongを自動返信します。アプリケーション独自のheartbeat messageは使いません。
 CoreS3はcontrol ping受信または映像フレーム送信成功のたびにJS外のESP-IDF timer watchdogを
-feedし、25秒間どちらも進まなければ再起動して復旧します。
+feedし、75秒間どちらも進まない場合だけ再起動して復旧します。Wi-Fiの省電力機能は無効化して
+受信遅延を抑え、切断時はESP-IDFのreason codeをserial traceへ出力します。
 MicroLinkのTCP送信は5秒の`SO_SNDTIMEO`を使い、送信windowが回復しない場合は
 `EAGAIN`を無期限再試行せずtransport errorとしてWebSocketの再接続へ進みます。
 WireGuard handshakeにはSNTP同期済みのwall clockを使い、再起動後の古いuptimeがreplay判定されるのを防ぎます。

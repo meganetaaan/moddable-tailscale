@@ -53,7 +53,7 @@ export default class CameraStream {
 		return this.fps;
 	}
 
-	async run(writer, isConnected, hello) {
+	async run(writer, isConnected, hello, options = {}) {
 		let nextFrameAt = Date.now() + this.interval;
 		try {
 			try {
@@ -122,7 +122,10 @@ export default class CameraStream {
 			}
 		}
 		finally {
-			this.close();
+			if (options.keepCameraOpen)
+				this.onStateChanged?.("waiting");
+			else
+				this.close();
 		}
 	}
 
@@ -137,14 +140,12 @@ export default class CameraStream {
 			imageType: Bitmap.RGB565LE,
 			format: "buffer/disposable",
 			onReadable: () => {
-				// Keep at most one JS-owned frame. If the network write is blocked,
-				// leaving the native buffers queued applies backpressure without
-				// flooding the JS event loop and starving heartbeat timers.
-				if (this.latestFrame)
-					return;
 				const frame = camera.read();
 				if (!frame)
 					return;
+				// Keep the driver queue moving while the network is unavailable.
+				// Disposable frames must be returned before all native slots fill.
+				this.latestFrame?.close?.();
 				this.latestFrame = frame;
 			},
 		});

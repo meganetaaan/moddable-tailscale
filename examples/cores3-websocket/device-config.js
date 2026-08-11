@@ -134,6 +134,14 @@ export default class DeviceConfig {
 		native.restart();
 	}
 
+	prepareWiFi() {
+		native.wifiPrepare();
+	}
+
+	takeWiFiDisconnectReason() {
+		return native.wifiDisconnectReason();
+	}
+
 	startHeartbeatWatchdog(timeout) {
 		native.watchdogStart(timeout);
 	}

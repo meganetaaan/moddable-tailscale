@@ -49,7 +49,7 @@ export default class CameraStream {
 		return this.fps;
 	}
 
-	async run(writer, isConnected, hello) {
+	async run(writer, isConnected, hello, options = {}) {
 		let nextFrameAt = Date.now() + this.interval;
 		try {
 			try {
@@ -112,7 +112,10 @@ export default class CameraStream {
 			}
 		}
 		finally {
-			this.close();
+			if (options.keepCameraOpen)
+				this.onStateChanged?.("waiting");
+			else
+				this.close();
 		}
 	}
 
@@ -126,11 +129,11 @@ export default class CameraStream {
 			imageType: "jpeg",
 			format: "buffer/disposable",
 			onReadable: () => {
-				if (this.latestFrame)
-					return;
 				const frame = camera.read();
-				if (frame)
-					this.latestFrame = frame;
+				if (!frame)
+					return;
+				this.latestFrame?.close?.();
+				this.latestFrame = frame;
 			},
 		});
 		this.camera = camera;
