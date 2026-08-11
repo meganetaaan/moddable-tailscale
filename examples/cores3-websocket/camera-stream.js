@@ -7,25 +7,29 @@ const DEFAULT_WIDTH = 240;
 const DEFAULT_HEIGHT = 176;
 const DEFAULT_FPS = 1;
 const DEFAULT_JPEG_QUALITY = 50;
-const WRITE_TIMEOUT = 10_000;
+const WRITE_TIMEOUT = 30_000;
 
-function delay(milliseconds) {
-	return new Promise(resolve => Timer.set(resolve, milliseconds));
-}
-
-function writeWithTimeout(writer, value) {
+function writeWithTimeout(socket, value) {
 	return new Promise((resolve, reject) => {
-		const timer = Timer.set(() => reject(new Error("WebSocket write timed out")), WRITE_TIMEOUT);
-		writer.write(value).then(
-			result => {
-				Timer.clear(timer);
-				resolve(result);
-			},
-			error => {
-				Timer.clear(timer);
+		let settled = false;
+		let timer;
+		const finish = error => {
+			if (settled)
+				return;
+			settled = true;
+			Timer.clear(timer);
+			if (error)
 				reject(error);
-			},
-		);
+			else
+				resolve();
+		};
+		timer = Timer.set(() => finish(new Error("WebSocket write timed out")), WRITE_TIMEOUT);
+		try {
+			socket.send(value, {onComplete: () => finish(), onError: finish});
+		}
+		catch (error) {
+			finish(error);
+		}
 	});
 }
 
@@ -37,8 +41,8 @@ export default class CameraStream {
 		this.interval = Math.round(1_000 / this.fps);
 		this.quality = options.quality ?? DEFAULT_JPEG_QUALITY;
 		this.onStateChanged = options.onStateChanged;
+		this.onFrameSent = options.onFrameSent;
 		this.camera = undefined;
-		this.latestFrame = undefined;
 		this.framesSent = 0;
 	}
 
@@ -53,20 +57,19 @@ export default class CameraStream {
 		return this.fps;
 	}
 
-	async run(writer, isConnected, hello, options = {}) {
-		let nextFrameAt = Date.now() + this.interval;
+	async run(socket, isConnected, hello, options = {}) {
 		try {
 			try {
 				this.start();
 			}
 			catch (error) {
-				await writeWithTimeout(writer, JSON.stringify({
+				await writeWithTimeout(socket, JSON.stringify({
 					type: "camera.error",
 					message: String(error),
 				}));
 				throw error;
 			}
-			await writeWithTimeout(writer, JSON.stringify({
+			await writeWithTimeout(socket, JSON.stringify({
 				...hello,
 				camera: {
 					format: "jpeg",
@@ -80,46 +83,7 @@ export default class CameraStream {
 				height: this.height,
 				fps: this.fps,
 			});
-
-			while (isConnected()) {
-				const interval = this.interval;
-				const wait = nextFrameAt - Date.now();
-				if (wait > 0)
-					await delay(wait);
-				nextFrameAt += interval;
-				const frame = this.takeLatestFrame();
-				if (!frame) {
-					this.onStateChanged?.("waiting");
-					continue;
-				}
-
-				let jpeg;
-				try {
-					jpeg = encodeJPEG(frame, this.width, this.height, this.quality);
-				}
-				finally {
-					frame.close?.();
-				}
-
-				try {
-					const bytes = new Uint8Array(jpeg);
-					await writeWithTimeout(writer, bytes);
-					this.framesSent += 1;
-					this.onStateChanged?.("frame", {
-						frameNumber: this.framesSent,
-						byteLength: bytes.byteLength,
-					});
-				}
-				finally {
-					jpeg = undefined;
-				}
-
-				// Avoid burst catch-up after temporary network or encoding stalls.
-				if (this.interval !== interval)
-					nextFrameAt = Date.now() + this.interval;
-				else if ((Date.now() - nextFrameAt) > interval)
-					nextFrameAt = Date.now() + interval;
-			}
+			await this.streamFrames(socket, isConnected);
 		}
 		finally {
 			if (options.keepCameraOpen)
@@ -127,6 +91,127 @@ export default class CameraStream {
 			else
 				this.close();
 		}
+	}
+
+	streamFrames(socket, isConnected) {
+		let nextFrameAt = Date.now() + this.interval;
+		return new Promise((resolve, reject) => {
+			let timer;
+			let writeTimer;
+			let settled = false;
+			let pendingJPEG;
+			let pendingInterval;
+			let pendingByteLength;
+
+			const clearWriteTimer = () => {
+				if (!writeTimer)
+					return;
+				Timer.clear(writeTimer);
+				writeTimer = undefined;
+			};
+
+			const finish = error => {
+				if (settled)
+					return;
+				settled = true;
+				if (timer)
+					Timer.clear(timer);
+				clearWriteTimer();
+				if (error)
+					reject(error);
+				else
+					resolve();
+			};
+
+			const onWriteTimeout = () => {
+				writeTimer = undefined;
+				finish(new Error("WebSocket frame write timed out"));
+			};
+
+			const schedule = () => {
+				if (!isConnected()) {
+					finish();
+					return;
+				}
+				timer = Timer.set(sendFrame, Math.max(1, nextFrameAt - Date.now()));
+			};
+
+			const advance = interval => {
+				if (this.interval !== interval)
+					nextFrameAt = Date.now() + this.interval;
+				else if ((Date.now() - nextFrameAt) > interval)
+					nextFrameAt = Date.now() + interval;
+				schedule();
+			};
+
+			const onWriteComplete = () => {
+				const interval = pendingInterval;
+				const byteLength = pendingByteLength;
+				pendingJPEG = undefined;
+				clearWriteTimer();
+				if (settled)
+					return;
+				this.framesSent += 1;
+				this.onFrameSent?.(this.framesSent, byteLength);
+				advance(interval);
+			};
+
+			const onWriteError = error => {
+				pendingJPEG = undefined;
+				clearWriteTimer();
+				finish(error);
+			};
+
+			// Only one frame is in flight, so these callback records can be reused
+			// for the whole session instead of allocating closures at camera rate.
+			const sendCallbacks = {onComplete: onWriteComplete, onError: onWriteError};
+
+			const sendFrame = () => {
+				timer = undefined;
+				if (!isConnected()) {
+					finish();
+					return;
+				}
+				const interval = this.interval;
+				nextFrameAt += interval;
+				const frame = this.takeLatestFrame();
+				if (!frame) {
+					this.onStateChanged?.("waiting");
+					advance(interval);
+					return;
+				}
+
+				let jpeg;
+				try {
+					jpeg = encodeJPEG(frame, this.width, this.height, this.quality);
+				}
+				catch (error) {
+					finish(error);
+					return;
+				}
+				finally {
+					frame.close?.();
+				}
+
+				const bytes = new Uint8Array(jpeg);
+				const byteLength = bytes.byteLength;
+				pendingJPEG = jpeg;
+				pendingInterval = interval;
+				pendingByteLength = byteLength;
+				writeTimer = Timer.set(onWriteTimeout, WRITE_TIMEOUT);
+				try {
+					socket.send(bytes, sendCallbacks);
+				}
+				catch (error) {
+					pendingJPEG = undefined;
+					clearWriteTimer();
+					jpeg = undefined;
+					finish(error);
+				}
+			};
+
+			schedule();
+		});
 	}
 
 	start() {
@@ -139,15 +224,6 @@ export default class CameraStream {
 			// CoreS3's GC0308 emits raw pixels, so JPEG is encoded in software.
 			imageType: Bitmap.RGB565LE,
 			format: "buffer/disposable",
-			onReadable: () => {
-				const frame = camera.read();
-				if (!frame)
-					return;
-				// Keep the driver queue moving while the network is unavailable.
-				// Disposable frames must be returned before all native slots fill.
-				this.latestFrame?.close?.();
-				this.latestFrame = frame;
-			},
 		});
 		this.camera = camera;
 		this.width = camera.width;
@@ -156,18 +232,13 @@ export default class CameraStream {
 	}
 
 	takeLatestFrame() {
-		let frame = this.latestFrame;
-		this.latestFrame = undefined;
-		// onReadable notifications may already have been consumed while a frame
-		// was pending. Pull one queued native frame directly on the next tick.
-		if (!frame && this.camera)
-			frame = this.camera.read();
-		return frame;
+		// Poll at the requested stream rate. The ESP32 camera task retains up to
+		// three native frames, so an onReadable callback for every sensor frame is
+		// unnecessary and can overwhelm the shared JS event queue at 8 fps.
+		return this.camera?.read();
 	}
 
 	close() {
-		this.latestFrame?.close?.();
-		this.latestFrame = undefined;
 		if (this.camera) {
 			this.camera.stop();
 			this.camera.close();

@@ -149,8 +149,12 @@ mcconfig -m -p esp32/m5stack_cores3
 サンプルはCoreS3の画面へWi-Fi、Tailnet、WebSocket、カメラ送信の状態を表示します。
 CoreS3固有の電源・I2C・ディスプレイ設定を使うため、`-p esp32/m5stack_cores3`を指定します。
 hubとのWebSocketが終了した場合は本体を再起動せず、Wi-Fi/TailnetとWebSocketを段階的に再接続します。
-カメラは接続をまたいで維持し、送信待ち中も古いframeをcloseして最新frameへ更新するため、
-hub再起動後もnative camera bufferを詰まらせず配信を再開できます。
+カメラは接続をまたいで維持し、送信timerからnative camera queueを直接読みます。sensorの撮影周期ごとの
+`onReadable`通知をJS queueへ積まないため、hub再起動後や8 fps送信時もevent queueを詰まらせません。
+映像送信は各timer callbackで1 frameだけ処理する状態機械として動作し、8 fpsの連続配信でも
+WebSocketの送信キューへcallback方式で直接投入します。高頻度のWritableStream Promise連鎖による
+JavaScript stackの増加を避けます。Tailnet、WebSocket、camera処理が重なる瞬間のpeakに備え、
+CoreS3とM5CameraはいずれもXS stackを8192 slots確保します。
 Denoは30秒のidle timeoutでRFC 6455 pingを送り、Moddableの下位WebSocketClientが
 同じpayloadのpongを自動返信します。アプリケーション独自のheartbeat messageは使いません。
 CoreS3はcontrol ping受信または映像フレーム送信成功のたびにJS外のESP-IDF timer watchdogを

@@ -13,7 +13,7 @@
 			"initial": 8192,
 			"incremental": 0
 		},
-		"stack": 2048
+		"stack": 8192
 	},
 	"include": [
 		"$(MODDABLE)/examples/manifest_base.json",

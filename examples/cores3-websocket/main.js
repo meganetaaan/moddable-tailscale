@@ -13,7 +13,7 @@ import StatusDisplay from "status-display";
 import USBProvisioning from "usb-provisioning";
 
 const PROTOCOL_VERSION = 1;
-const FIRMWARE_VERSION = "0.2.1";
+const FIRMWARE_VERSION = "0.3.2";
 const STACKCAM_CONFIG = config.stackcam ?? {};
 const DEVICE_MODEL = STACKCAM_CONFIG.model ?? "m5stack-cores3";
 // Values from mc/config can live in the read-only XS archive. JSON.stringify
@@ -22,7 +22,10 @@ const DEVICE_MODEL = STACKCAM_CONFIG.model ?? "m5stack-cores3";
 const CAPABILITIES = Object.freeze(Array.from(STACKCAM_CONFIG.capabilities ?? ["camera", "display", "provision.usb", "provision.ble"]));
 const BLE_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.ble");
 const USB_PROVISIONING_ENABLED = CAPABILITIES.includes("provision.usb");
-const WEBSOCKET_WRITE_TIMEOUT = 10_000;
+// Tailnet can pause TCP writes briefly while refreshing a WireGuard session.
+// Keep this below the native heartbeat watchdog, but above the hub's transient
+// network recovery window so a delayed command ACK does not force a reconnect.
+const WEBSOCKET_WRITE_TIMEOUT = 30_000;
 const HEARTBEAT_WATCHDOG_MS = 75_000;
 
 let tailnet;
@@ -52,20 +55,18 @@ const cameraStream = new CameraStream({
 			status.set("camera", `${cameraStream.width}x${cameraStream.height} @ ${detail.fps}fps`, "ok");
 		else if (state === "waiting")
 			status.set("camera", "WAITING FRAME", "pending");
-		else if (state === "frame") {
-			// A completed frame proves that the JS and TCP send paths are still
-			// making progress even when Deno does not need to send an idle ping.
-			if (heartbeatWatchdogSocket)
-				deviceConfig.feedHeartbeatWatchdog();
-			// Serial output can block the JS thread when no USB monitor is reading it.
-			// Keep diagnostics useful without logging every frame at detail-view rates.
-			if ((detail.frameNumber % Math.max(10, cameraStream.fps * 10)) === 0)
-				trace(`Camera frame ${detail.frameNumber}: ${detail.byteLength} bytes\n`);
-			if ((detail.frameNumber % 5) === 0)
-				status.set("camera", `${cameraStream.fps}fps F${detail.frameNumber} ${detail.byteLength >> 10}KiB`, "ok");
-		}
 		else if (state === "stopped")
 			status.set("camera", "STOPPED", "error");
+	},
+	onFrameSent(frameNumber, byteLength) {
+		// A completed frame proves that the JS and TCP send paths are still
+		// making progress even when Deno does not need to send an idle ping.
+		if (heartbeatWatchdogSocket)
+			deviceConfig.feedHeartbeatWatchdog();
+		const interval = Math.max(10, cameraStream.fps * 10);
+		if ((frameNumber % interval) !== 0)
+			return;
+		status.set("camera", `${cameraStream.fps}fps F${frameNumber} ${byteLength >> 10}KiB`, "ok");
 	},
 });
 
@@ -164,11 +165,31 @@ function commandError(code, message) {
 	return error;
 }
 
-function writeWebSocket(writer, value) {
-	return waitWithTimeout(writer.write(value), WEBSOCKET_WRITE_TIMEOUT, "WebSocket write timed out");
+function writeWebSocket(socket, value) {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let timer;
+		const finish = error => {
+			if (settled)
+				return;
+			settled = true;
+			Timer.clear(timer);
+			if (error)
+				reject(error);
+			else
+				resolve();
+		};
+		timer = Timer.set(() => finish(new Error("WebSocket write timed out")), WEBSOCKET_WRITE_TIMEOUT);
+		try {
+			socket.send(value, {onComplete: () => finish(), onError: finish});
+		}
+		catch (error) {
+			finish(error);
+		}
+	});
 }
 
-async function handleCommand(message, writer, cameraStream) {
+async function handleCommand(message, socket, cameraStream) {
 	if ((message.protocol !== PROTOCOL_VERSION) || (typeof message.commandId !== "string"))
 		throw commandError("invalid_command", "invalid command envelope");
 	const payload = message.payload ?? {};
@@ -189,7 +210,7 @@ async function handleCommand(message, writer, cameraStream) {
 	else
 		throw commandError("unknown_command", `unknown command: ${message.command}`);
 
-	await writeWebSocket(writer, JSON.stringify({
+	await writeWebSocket(socket, JSON.stringify({
 		type: "command.ack",
 		protocol: PROTOCOL_VERSION,
 		commandId: message.commandId,
@@ -199,7 +220,7 @@ async function handleCommand(message, writer, cameraStream) {
 	}));
 }
 
-async function readServerMessages(readable, writer, cameraStream, socket) {
+async function readServerMessages(readable, cameraStream, socket) {
 	const reader = readable.getReader();
 	try {
 		while (webSocket === socket) {
@@ -219,10 +240,10 @@ async function readServerMessages(readable, writer, cameraStream, socket) {
 			if (message.type !== "command")
 				continue;
 			try {
-				await handleCommand(message, writer, cameraStream);
+				await handleCommand(message, socket, cameraStream);
 			}
 			catch (error) {
-				await writeWebSocket(writer, JSON.stringify({
+				await writeWebSocket(socket, JSON.stringify({
 					type: "command.ack",
 					protocol: PROTOCOL_VERSION,
 					commandId: String(message.commandId ?? ""),
@@ -271,22 +292,21 @@ async function openWebSocket() {
 				retireWebSocket(socket);
 			},
 		);
-		const {readable, writable} = await waitWithTimeout(socket.opened, 65_000, "WebSocket connection timed out");
+		const {readable} = await waitWithTimeout(socket.opened, 65_000, "WebSocket connection timed out");
 		wasOpened = true;
 		trace("WebSocket connected\n");
 		status.set("websocket", "CONNECTED", "ok");
 
-		const writer = writable.getWriter();
 		// This ESP-IDF timer runs outside the JS thread, so it can reboot even if
 		// a native TCP write blocks the event loop completely.
 		heartbeatWatchdogSocket = socket;
 		deviceConfig.startHeartbeatWatchdog(HEARTBEAT_WATCHDOG_MS);
 		if (cameraSessionTask)
 			await waitWithTimeout(cameraSessionTask, 5_000, "Previous camera session did not stop");
-		const readTask = readServerMessages(readable, writer, cameraStream, socket).catch(error => {
+		const readTask = readServerMessages(readable, cameraStream, socket).catch(error => {
 			trace(`WebSocket read error: ${error}\n`);
 		});
-		const cameraTask = cameraStream.run(writer, () => webSocket === socket, {
+		const cameraTask = cameraStream.run(socket, () => webSocket === socket, {
 			type: "device.hello",
 			protocol: PROTOCOL_VERSION,
 			deviceId: deviceConfig.deviceId,
@@ -305,9 +325,9 @@ async function openWebSocket() {
 		});
 		cameraSessionTask = cameraTask;
 
-		// A transport error can leave an in-flight WritableStream operation
-		// pending in the SDK. Reconnect as soon as any side observes closure;
-		// cameraTask remains the sole owner of the retired writer until GC.
+		// Reconnect as soon as any side observes closure. Camera frames use the
+		// callback-based socket send path to avoid an unbounded high-rate chain of
+		// WritableStream promises in XS.
 		await Promise.race([closedTask, readTask, cameraTask]);
 	}
 	catch (error) {

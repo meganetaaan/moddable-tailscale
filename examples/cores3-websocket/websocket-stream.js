@@ -68,7 +68,7 @@ class WebSocketStream {
 							const error = new Error("WebSocket closed");
 							this.#state = 3;
 							this.#readableController.close();
-							this.#drainWritable();
+							this.#drainWritable(error);
 							data = new Uint8Array(data);
 							this.#closed.resolve({
 								closeCode: (data[0] << 8) | data[1],
@@ -121,8 +121,9 @@ class WebSocketStream {
 							? new Uint8Array(writeData, offset, dataLength)
 							: writeData;
 						this.#writableLength = this.#clientWrite(data, writeOptions);
-						buffer.result?.resolve();
 						buffers.shift();
+						buffer.result?.resolve();
+						buffer.onComplete?.();
 					}
 					else if (writableLength > 0) {
 						const moreOptions = {...writeOptions, more: true};
@@ -146,7 +147,7 @@ class WebSocketStream {
 					// its sink has an in-flight promise. Treat a transport failure as
 					// an abnormal close and let the owner reconnect instead.
 					this.#readableController.close();
-					this.#drainWritable();
+					this.#drainWritable(error);
 					this.#closed.resolve({closeCode: 1006, reason: error.message});
 				}
 			},
@@ -222,6 +223,32 @@ class WebSocketStream {
 		return this.#url;
 	}
 
+	send(data, callbacks = {}) {
+		if (this.#state === 2)
+			throw new Error("WebSocket closing");
+		if (this.#state === 3)
+			throw new Error("WebSocket closed");
+		let binary = false;
+		if (data instanceof ArrayBuffer)
+			binary = true;
+		else if ((data instanceof DataView) || (data instanceof TypedArray)) {
+			binary = true;
+			if ((data.byteOffset === 0) && (data.byteLength === data.buffer.byteLength))
+				data = data.buffer;
+			else
+				data = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+		}
+		else
+			data = ArrayBuffer.fromString(data);
+		const buffer = this.#write(data, {binary});
+		if (buffer) {
+			buffer.onComplete = callbacks.onComplete;
+			buffer.onError = callbacks.onError;
+		}
+		else
+			callbacks.onComplete?.();
+	}
+
 	close(options) {
 		let code = options?.closeCode;
 		let reason = options?.reason;
@@ -248,10 +275,16 @@ class WebSocketStream {
 		}
 	}
 
-	#drainWritable() {
+	#drainWritable(error) {
 		const buffers = this.#writableBuffers;
-		while (buffers.length)
-			buffers.shift().result?.resolve();
+		while (buffers.length) {
+			const buffer = buffers.shift();
+			buffer.result?.resolve();
+			if (error)
+				buffer.onError?.(error);
+			else
+				buffer.onComplete?.();
+		}
 	}
 
 	#read(count, options) {
