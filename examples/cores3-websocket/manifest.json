@@ -2,7 +2,7 @@
 	"build": {
 		"ESP32_SUBCLASS": "esp32s3",
 		"USE_USB": "2",
-		"SDKCONFIGPATH": "./sdkconfig"
+		"SDKCONFIGPATH": "./sdkconfig-cores3"
 	},
 	"creation": {
 		"static": 0,
@@ -14,20 +14,54 @@
 			"initial": 8192,
 			"incremental": 0
 		},
-		"stack": 1024
+		"stack": 2048
 	},
 	"include": [
 		"$(MODDABLE)/examples/manifest_base.json",
 		"$(MODDABLE)/examples/manifest_net.json",
+		"$(MODDABLE)/examples/manifest_commodetto.json",
+		"$(MODDABLE)/modules/network/ble/manifest_server.json",
+		"$(MODDABLE)/modules/io/imagein/camera/manifest.json",
 		"$(MODDABLE)/modules/web/streams/websocket/manifest.json",
-		"../../manifest.json"
+		"../../manifest.json",
+		"./manifest-camera-config.json"
 	],
+	"config": {
+		"startupSound": null,
+		"brightness": 100
+	},
+	"defines": {
+		"xs": {
+			"abortHook": 1
+		}
+	},
 	"modules": {
 		"*": "./main",
-		"credentials": "./credentials"
+		"camera-stream": "./camera-stream",
+		"ble-provisioning": "./ble-provisioning",
+		"credentials": "./credentials",
+		"device-config": "./device-config",
+		"device-config-native": "./native/device-config-native",
+		"device-config/idf/*": "$(IDF_PATH)/components/esp_driver_usb_serial_jtag/include/driver/usb_serial_jtag.h",
+		"jpeg-encoder": "./jpeg-encoder",
+		"provisioning-protocol": "./provisioning-protocol",
+		"cores3-camera-native/*": "./native/*",
+		"status-display": "./status-display",
+		"stackcam-websocket-stream": "./websocket-stream",
+		"usb-provisioning": "./usb-provisioning"
+	},
+	"ble": {
+		"*": "./bleservices/*"
+	},
+	"resources": {
+		"*-mask": "$(MODDABLE)/examples/assets/fonts/OpenSans-Semibold-18"
 	},
 	"platforms": {
-		"esp32": {},
+		"esp32": {
+			"dependency": [
+				{ "idf": "esp_driver_usb_serial_jtag" }
+			]
+		},
 		"...": {
 			"error": "This example requires ESP32-S3"
 		}

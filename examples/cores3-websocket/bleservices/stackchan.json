@@ -1,0 +1,21 @@
+{
+	"service": {
+		"uuid": "7A910001-6B8A-4D1F-9A3D-535441434B43",
+		"characteristics": {
+			"rx": {
+				"uuid": "7A910002-6B8A-4D1F-9A3D-535441434B43",
+				"type": "String",
+				"maxBytes": 244,
+				"permissions": "writeEncrypted",
+				"properties": "write,writeNoResponse"
+			},
+			"tx": {
+				"uuid": "7A910003-6B8A-4D1F-9A3D-535441434B43",
+				"type": "String",
+				"maxBytes": 244,
+				"permissions": "readEncrypted",
+				"properties": "read,notify"
+			}
+		}
+	}
+}
