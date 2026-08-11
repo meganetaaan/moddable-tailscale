@@ -666,3 +666,47 @@ index ed40942..bda8fb2 100644
          }
  
          /* Yield - 10ms loop rate for minimum packet processing latency.
+diff --git a/components/microlink/src/ml_tcp.c b/components/microlink/src/ml_tcp.c
+index e65d72d..4237945 100644
+--- a/components/microlink/src/ml_tcp.c
++++ b/components/microlink/src/ml_tcp.c
+@@ -19,6 +19,8 @@
+ 
+ static const char *TAG = "ml_tcp";
+ 
++#define TCP_SEND_TIMEOUT_MS 5000
++
+ /* ============================================================================
+  * Internal Types
+  * ========================================================================== */
+@@ -193,6 +195,17 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
+     ESP_LOGI(TAG, "TCP connected to %s:%u (%lld ms)", ip_str, dest_port,
+              (t_end - t_start) / 1000);
+ 
++    /* The connect timeout is not an appropriate lifetime send timeout. Keep
++     * camera uploads bounded so a full TCP window becomes a transport error
++     * instead of pinning the socket worker forever. */
++    struct timeval send_tv = {
++        .tv_sec = TCP_SEND_TIMEOUT_MS / 1000,
++        .tv_usec = (TCP_SEND_TIMEOUT_MS % 1000) * 1000,
++    };
++    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv, sizeof(send_tv)) != 0) {
++        ESP_LOGW(TAG, "SO_SNDTIMEO setup failed: errno=%d", errno);
++    }
++
+     /* Allocate handle */
+     microlink_tcp_socket_t *sock = calloc(1, sizeof(microlink_tcp_socket_t));
+     if (!sock) {
+@@ -217,8 +230,10 @@ esp_err_t microlink_tcp_send(microlink_tcp_socket_t *sock, const void *data, siz
+         int n = send(sock->fd, (const uint8_t *)data + sent, len - sent, 0);
+         if (n <= 0) {
+             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+-                vTaskDelay(pdMS_TO_TICKS(10));
+-                continue;
++                ESP_LOGE(TAG, "TCP send timed out after %d ms (sent %d/%d)",
++                         TCP_SEND_TIMEOUT_MS, (int)sent, (int)len);
++                sock->connected = false;
++                return ESP_ERR_TIMEOUT;
+             }
+             ESP_LOGE(TAG, "TCP send failed: n=%d errno=%d (sent %d/%d)",
+                      n, errno, (int)sent, (int)len);
