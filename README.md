@@ -67,29 +67,16 @@ CoreS3用auth keyへこのtagを付与して、
 個体ごとに設定する運用ならone-off tagged keyを推奨します。
 
 中央PCを専用サーバーとして扱う場合は`tag:stackchan-hub`を付け、
-[grant](https://tailscale.com/docs/features/access-control/grants)を次のように追加します。
-既存の`tagOwners`と`grants`は消さず、それぞれのobjectとarrayへマージしてください。
+[grant](https://tailscale.com/docs/features/access-control/grants)で通信先を制限します。
+[`examples/tailnet-policy.hujson`](examples/tailnet-policy.hujson)に、カメラからHubの
+TCP 8080だけを許可し、Tailnet memberから監視画面を許可するpolicyとテストを収録しています。
+既存policyへ適用するときは`tagOwners`、`grants`、`tests`の各要素をマージし、Tailscale管理画面の
+policy validatorでテストが通ることを確認してから保存してください。
 
-```json
-{
-  "tagOwners": {
-    "tag:stackchan-camera": [],
-    "tag:stackchan-hub": []
-  },
-  "grants": [
-    {
-      "src": ["tag:stackchan-camera"],
-      "dst": ["tag:stackchan-hub"],
-      "ip": ["tcp:8080"]
-    },
-    {
-      "src": ["autogroup:member"],
-      "dst": ["tag:stackchan-hub"],
-      "ip": ["tcp:8080"]
-    }
-  ]
-}
-```
+中央PCへのtag付与は管理画面のMachines/Devicesから`tag:stackchan-hub`を追加するか、
+PowerShellで`tailscale login --advertise-tags=tag:stackchan-hub`を実行して再認証します。
+CoreS3は後述の端末別provisioningで`tag:stackchan-camera`付きauth keyを使うため、
+登録と同時にtag identityになります。
 
 Tagを付けるとnodeのuser identityがtag identityへ置き換わるため、中央PCを
 user-owned deviceのままにする場合は`tag:stackchan-hub`を付けません。
@@ -101,6 +88,28 @@ PC側ではTailnetへ接続した状態でcamera relay serverを起動できま�
 ```sh
 deno run --allow-net tools/camera-server.ts 8080 "$(tailscale ip -4)"
 ```
+
+`--state-dir`を指定すると、端末レジストリ、コマンド履歴、各端末の最終JPEGを保存します。
+JPEGの書き込みは最大で約1回/秒・端末にまとめられ、Hub再起動後は各端末をOFFLINE表示のまま
+最終画像付きで復元します。
+
+```powershell
+$state = Join-Path $env:LOCALAPPDATA "StackChanCameraHub"
+deno run --allow-net "--allow-read=$state" "--allow-write=$state" `
+  tools/camera-server.ts 8080 (tailscale ip -4 | Select-Object -First 1) `
+  "--state-dir=$state"
+```
+
+Windowsログオン時にHubを自動起動し、異常終了時に1分後から再起動するユーザー単位の
+Scheduled Taskは次で登録できます。launcherはmutexで同じportの二重起動を防ぎます。
+
+```powershell
+./scripts/install-camera-hub.ps1
+Get-ScheduledTask StackChanCameraHub | Get-ScheduledTaskInfo
+```
+
+解除する場合は`./scripts/install-camera-hub.ps1 -Uninstall`を実行します。リポジトリを移動すると
+Scheduled Task内のscript pathが古くなるため、移動後にinstall scriptを再実行してください。
 
 Tailnet IPを指定した場合は`127.0.0.1:8080`でも同じregistryを自動的に待ち受けます。
 カメラ側はTailnetから、管理画面とBLE設定は中央PCのlocalhostから利用でき、LAN側へ
@@ -164,6 +173,24 @@ $env:STACKCHAN_AUTH_KEY = "tskey-auth-..."
 
 `get`はSSID、auth key/passwordの設定有無、device ID、hub URLだけを返し、秘密値は返しません。
 `clear`でNVS設定を削除してfirmware内fallbackへ戻し、`restart`で再起動できます。
+
+端末ごとに再利用不可のtagged auth keyを自動発行して、そのままUSB設定する場合は、Tailscale
+管理画面でOAuth clientを作成します。`auth_keys`のwrite scopeと
+`tag:stackchan-camera`を付与し、client ID/secretを環境変数へ入れて実行してください。
+auth keyは既定で1時間有効、pre-authorized、non-reusable、non-ephemeralとして生成され、
+画面やファイルへ出さず`provision-usb.ps1`へ直接渡されます。
+
+```powershell
+$env:TS_API_CLIENT_ID = "k..."
+$env:TS_API_CLIENT_SECRET = "tskey-client-..."
+./scripts/provision-camera.ps1 -Port COM4 `
+  -WifiSsid "YOUR_WIFI_SSID" -WifiPassword "YOUR_WIFI_PASSWORD"
+Remove-Item Env:TS_API_CLIENT_SECRET
+```
+
+OAuth client secretはauth keyより強い長期資格情報です。中央PCだけで扱い、ブラウザーや
+firmwareへ渡さないでください。BLE設定では管理者資格情報をブラウザーへ置かず、管理画面で
+発行したone-off keyを従来どおり入力します。
 
 BLE設定は未接続時に3分間advertiseし、接続中は受付タイマーを停止します。Windowsでは最初に
 「設定」→「Bluetoothとデバイス」→「デバイスの追加」から`StackCam-…`を選び、CoreS3画面の
@@ -267,7 +294,7 @@ DERPのTLSはESP-IDF証明書バンドルで検証しますが、WireGuard内の
 ./scripts/verify.sh
 deno fmt --check tools/echo-server.ts tools/camera-server.ts tools/camera-server.test.ts tools/camera-soak.ts tools/camera-soak.test.ts
 deno check tools/echo-server.ts tools/camera-server.ts tools/camera-server.test.ts tools/camera-soak.ts tools/camera-soak.test.ts
-deno test --allow-net tools/camera-server.test.ts tools/camera-soak.test.ts
+deno test --allow-net --allow-read --allow-write tools/camera-server.test.ts tools/camera-soak.test.ts
 ```
 
 実機を使わず、2台の仮想カメラを詳細表示の8fpsで10分間流すsoak testは次で実行します。
