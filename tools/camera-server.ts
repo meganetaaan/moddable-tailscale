@@ -9,6 +9,7 @@ const PERSISTENCE_VERSION = 1;
 const DEFAULT_PERSISTENCE_DELAY_MS = 1_000;
 const VIEWER_FPS = Object.freeze({ none: 1, grid: 2, detail: 8 });
 const encoder = new TextEncoder();
+const QR_CODE_CLIENT_PATH = new URL("./vendor/qrcode.js", import.meta.url);
 
 export type DeviceHello = {
   type: "device.hello";
@@ -564,6 +565,14 @@ export function createCameraRegistry(
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
+    if (url.pathname === "/assets/qrcode.js") {
+      return new Response(Deno.readTextFileSync(QR_CODE_CLIENT_PATH), {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "public, max-age=31536000, immutable",
+        },
+      });
+    }
     if (url.pathname === "/" || url.pathname.startsWith("/device/")) {
       return new Response(INDEX_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
@@ -1068,6 +1077,12 @@ const PROVISION_HTML = `<!doctype html>
   .hint, .device { color: #9bb1c0; }
   .transport { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   .transport strong { margin: 14px 0 0 6px; }
+  details { margin-top: 16px; padding: 10px 12px; border: 1px solid #29465c; border-radius: 8px; }
+  summary { cursor: pointer; color: #afc4d2; }
+  input[type=checkbox] { width: auto; margin-right: 8px; }
+  #auth-panel { margin: 18px 0 4px; padding: 14px; border: 1px solid #2a8f63; border-radius: 10px; background: #09251d; }
+  #auth-panel[hidden] { display: none; }
+  #auth-panel canvas { display: block; width: min(240px, 100%); height: auto; margin: 12px auto; background: white; image-rendering: pixelated; }
   small { display: block; margin-top: 6px; color: #8fa8b8; }
 </style></head><body><main>
 <a href="/">← Camera hub</a><h1>StackCam device setup</h1>
@@ -1076,15 +1091,17 @@ const PROVISION_HTML = `<!doctype html>
 <section>
   <div class="transport"><button id="serial-connect">USBシリアルで接続</button><button id="ble-connect">BLEで接続</button><button id="disconnect" disabled>切断</button><strong id="state">未接続</strong></div>
   <p id="device" class="device">デバイス情報は接続後に表示されます。</p>
+  <div id="auth-panel" hidden><strong id="auth-state">Tailscaleへの登録が必要です</strong><canvas id="auth-qr"></canvas><a id="auth-open" target="_blank" rel="noopener">Tailscaleで認証</a></div>
   <label>Wi-Fi SSID<input id="ssid" autocomplete="off"></label>
   <label>Wi-Fi password<input id="password" type="password" autocomplete="new-password"><small>空欄の場合、現在の設定を変更しません。</small></label>
-  <label>Tailscale auth key<input id="auth" type="password" autocomplete="off"><small>空欄の場合、現在の設定を変更しません。</small></label>
   <label>Hub URL<input id="hub" value="ws://stackchan-hub:8080/camera"></label>
-  <button id="save" disabled>設定を保存</button><button id="read" disabled>状態を取得</button>
+  <details><summary>詳細設定（auth key）</summary><label>Tailscale auth key<input id="auth" type="password" autocomplete="off"><small>tag付き自動登録を使う場合だけ設定します。</small></label><label><input id="clear-auth" type="checkbox">保存済みauth keyを削除してAuthURL登録へ切り替える</label></details>
+  <button id="save" disabled>保存して再起動</button><button id="read" disabled>状態を取得</button>
   <button id="restart" disabled>再起動</button><button id="clear" disabled>NVS設定を消去</button>
+  <button id="tailnet-reset" disabled>Tailnet登録をやり直す</button>
   <pre id="log">ブラウザーから機密値を外部へ送信しません。</pre>
 </section>
-<script>
+<script src="/assets/qrcode.js"></script><script>
   const SERVICE = '7a910001-6b8a-4d1f-9a3d-535441434b43';
   const RX = '7a910002-6b8a-4d1f-9a3d-535441434b43';
   const TX = '7a910003-6b8a-4d1f-9a3d-535441434b43';
@@ -1094,14 +1111,18 @@ const PROVISION_HTML = `<!doctype html>
   const serialConnect = document.querySelector('#serial-connect'); const bleConnect = document.querySelector('#ble-connect');
   const disconnect = document.querySelector('#disconnect'); const deviceInfo = document.querySelector('#device');
   const ssid = document.querySelector('#ssid'); const password = document.querySelector('#password');
-  const auth = document.querySelector('#auth'); const hub = document.querySelector('#hub');
+  const auth = document.querySelector('#auth'); const clearAuth = document.querySelector('#clear-auth'); const hub = document.querySelector('#hub');
+  const authPanel = document.querySelector('#auth-panel'); const authState = document.querySelector('#auth-state');
+  const authQR = document.querySelector('#auth-qr'); const authOpen = document.querySelector('#auth-open');
   let transport; let decoder = new TextDecoder(); let buffer = '';
   let bleDevice; let bleRX;
   let serialPort; let serialReader; let serialWriter; let serialReadTask;
+  let expectedRestartUntil = 0; let serialReconnectTask;
+  const pending = new Map();
 
   function append(value) { log.textContent += '\\n' + value; log.scrollTop = log.scrollHeight; }
   function errorText(error) { return error && error.message ? error.message : String(error); }
-  function enabled(value) { for (const id of ['save','read','restart','clear']) document.querySelector('#'+id).disabled = !value; }
+  function enabled(value) { for (const id of ['save','read','restart','clear','tailnet-reset']) document.querySelector('#'+id).disabled = !value; }
   function connecting(value) {
     state.textContent = value; serialConnect.disabled = true; bleConnect.disabled = true; disconnect.disabled = true; enabled(false);
   }
@@ -1112,12 +1133,48 @@ const PROVISION_HTML = `<!doctype html>
     transport = undefined; state.textContent = value; serialConnect.disabled = false; bleConnect.disabled = false; disconnect.disabled = true; enabled(false);
   }
   function resetParser() { decoder = new TextDecoder(); buffer = ''; }
+  function drawQR(url, packed) {
+    let size; let isDark;
+    if (packed && Number.isInteger(packed.size) && /^[0-9a-f]+$/i.test(packed.bits || '')) {
+      const bytes = new Uint8Array(packed.bits.length >> 1);
+      for (let index = 0; index < bytes.length; index++) bytes[index] = parseInt(packed.bits.slice(index * 2, index * 2 + 2), 16);
+      size = packed.size; isDark = (row, column) => !!(bytes[(row * size + column) >> 3] & (0x80 >> ((row * size + column) & 7)));
+    } else {
+      if (typeof qrcode !== 'function') return false;
+      const generated = qrcode(0, 'M'); generated.addData(url, 'Byte'); generated.make();
+      size = generated.getModuleCount(); isDark = (row, column) => generated.isDark(row, column);
+    }
+    const quiet = 4; authQR.width = authQR.height = size + quiet * 2;
+    const context = authQR.getContext('2d'); context.fillStyle = '#fff'; context.fillRect(0, 0, authQR.width, authQR.height); context.fillStyle = '#000';
+    for (let row = 0; row < size; row++) for (let column = 0; column < size; column++) {
+      if (isDark(row, column)) context.fillRect(quiet + column, quiet + row, 1, 1);
+    }
+    return true;
+  }
+  function updateRuntime(runtime) {
+    const tailnet = runtime && runtime.tailnet;
+    if (!tailnet) return;
+    if (tailnet.state === 'needs-auth' && tailnet.authURL) {
+      authPanel.hidden = false; authState.textContent = 'Tailscaleへの登録が必要です';
+      authOpen.hidden = false; authOpen.href = tailnet.authURL; authQR.hidden = !drawQR(tailnet.authURL, tailnet.authQR);
+    } else if (tailnet.state === 'needs-approval') {
+      authPanel.hidden = false; authState.textContent = 'Tailscale管理画面で端末を承認してください';
+      authOpen.hidden = true; authQR.hidden = true;
+    } else if (tailnet.state === 'connected') {
+      authPanel.hidden = true; authOpen.removeAttribute('href'); authState.textContent = 'Tailnet接続済み';
+    } else if (tailnet.state === 'error') {
+      authPanel.hidden = false; authState.textContent = tailnet.error || 'Tailnetへの接続に失敗しました';
+      authOpen.hidden = true; authQR.hidden = true;
+    } else {
+      authPanel.hidden = true; authOpen.removeAttribute('href'); authQR.hidden = true;
+    }
+  }
   function updateConfig(message) {
     const config = message && message.type === 'provision.ack' ? message.config : undefined;
     if (!config) return;
     ssid.value = config.wifi && config.wifi.ssid ? config.wifi.ssid : '';
     hub.value = config.hubURL || 'ws://stackchan-hub:8080/camera';
-    password.value = ''; auth.value = '';
+    password.value = ''; auth.value = ''; clearAuth.checked = false;
     password.placeholder = config.wifi && config.wifi.passwordSet ? '設定済み' : '未設定';
     auth.placeholder = config.tailscale && config.tailscale.authKeySet ? '設定済み' : '未設定';
     deviceInfo.textContent = (config.deviceName || 'StackCam') + ' · ' + (config.deviceId || '') + ' · ' + (config.persisted ? 'NVS設定' : 'ファームウェア初期値');
@@ -1132,24 +1189,35 @@ const PROVISION_HTML = `<!doctype html>
       else if (!line.startsWith('{')) continue;
       if (!line) continue;
       append(line);
-      try { updateConfig(JSON.parse(line)); } catch {}
+      try {
+        const message = JSON.parse(line); updateConfig(message); updateRuntime(message.runtime);
+        if (message.type === 'provision.ack' && message.requestId && pending.has(message.requestId)) {
+          const request = pending.get(message.requestId); pending.delete(message.requestId); clearTimeout(request.timer);
+          if (message.ok) request.resolve(message); else request.reject(new Error(message.error || 'デバイスが要求を拒否しました'));
+        }
+      } catch (error) { append('ERROR: 応答解析: ' + errorText(error)); }
     }
   }
   async function send(message) {
-    const line = JSON.stringify({...message, requestId:crypto.randomUUID()}) + '\\n';
-    if (transport === 'serial') {
-      if (!serialWriter) throw new Error('USBシリアル未接続です');
-      await serialWriter.write(encoder.encode(PREFIX + line));
-      return;
+    const requestId = crypto.randomUUID(); const line = JSON.stringify({...message, requestId}) + '\\n';
+    const result = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('デバイス応答がタイムアウトしました')); }, 10000);
+      pending.set(requestId, {resolve, reject, timer});
+    });
+    try {
+      if (transport === 'serial') {
+        if (!serialWriter) throw new Error('USBシリアル未接続です');
+        await serialWriter.write(encoder.encode(PREFIX + line));
+      } else if (transport === 'ble') {
+        if (!bleRX) throw new Error('BLE未接続です');
+        const bytes = encoder.encode(line);
+        for (let offset = 0; offset < bytes.length; offset += 180) await bleRX.writeValueWithResponse(bytes.slice(offset, offset + 180));
+      } else throw new Error('デバイス未接続です');
+    } catch (error) {
+      const request = pending.get(requestId);
+      if (request) { pending.delete(requestId); clearTimeout(request.timer); request.reject(error); }
     }
-    if (transport === 'ble') {
-      if (!bleRX) throw new Error('BLE未接続です');
-      const bytes = encoder.encode(line);
-      for (let offset = 0; offset < bytes.length; offset += 180)
-        await bleRX.writeValueWithResponse(bytes.slice(offset, offset + 180));
-      return;
-    }
-    throw new Error('デバイス未接続です');
+    return result;
   }
   async function readSerial(port) {
     const reader = port.readable.getReader(); serialReader = reader;
@@ -1165,9 +1233,13 @@ const PROVISION_HTML = `<!doctype html>
       if (serialReader === reader) serialReader = undefined;
       reader.releaseLock();
       if (serialPort === port) {
+        const reconnect = Date.now() < expectedRestartUntil;
+        const previousInfo = port.getInfo ? port.getInfo() : {};
         serialPort = undefined;
         try { serialWriter && serialWriter.releaseLock(); } catch {}
-        serialWriter = undefined; serialReadTask = undefined; disconnected('切断');
+        serialWriter = undefined; serialReadTask = undefined;
+        try { await port.close(); } catch {}
+        if (reconnect) void reconnectSerial(previousInfo); else disconnected('切断');
       }
     }
   }
@@ -1185,22 +1257,54 @@ const PROVISION_HTML = `<!doctype html>
     const device = bleDevice; bleDevice = undefined; bleRX = undefined;
     if (device && device.gatt && device.gatt.connected) device.gatt.disconnect();
   }
+  function samePort(info, wanted) {
+    return !wanted || ((wanted.usbVendorId === undefined || info.usbVendorId === wanted.usbVendorId) &&
+      (wanted.usbProductId === undefined || info.usbProductId === wanted.usbProductId));
+  }
+  async function openSerial(port, reconnecting = false) {
+    connecting(reconnecting ? 'USBシリアル再接続中…' : 'USBシリアル接続中…'); resetParser();
+    await port.open({baudRate:115200, dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:4096});
+    serialPort = port;
+    if (!port.readable || !port.writable) throw new Error('シリアル入出力を開けません');
+    try { await port.setSignals({dataTerminalReady:false, requestToSend:false}); } catch (error) { append('WARN: 制御信号を設定できません: ' + errorText(error)); }
+    serialWriter = port.writable.getWriter(); serialReadTask = readSerial(port); transport = 'serial';
+    const info = port.getInfo ? port.getInfo() : {};
+    const ids = info.usbVendorId === undefined ? '' : ' (' + info.usbVendorId.toString(16).padStart(4,'0') + ':' + info.usbProductId.toString(16).padStart(4,'0') + ')';
+    connected('USBシリアル接続済み' + ids); append(reconnecting ? 'USBシリアルへ再接続しました。' : 'USBシリアルを115200 baudで開きました。');
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    await send({type:'provision.get'}); expectedRestartUntil = 0;
+  }
+  async function reconnectSerial(previousInfo) {
+    if (serialReconnectTask) return serialReconnectTask;
+    serialReconnectTask = (async () => {
+      while (!serialPort && Date.now() < expectedRestartUntil) {
+        connecting('USBシリアル再接続中…');
+        const ports = await navigator.serial.getPorts();
+        for (const port of ports) {
+          if (!samePort(port.getInfo ? port.getInfo() : {}, previousInfo)) continue;
+          try { await openSerial(port, true); return; } catch { await closeSerial(); }
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      if (!serialPort) disconnected('自動再接続失敗');
+    })().finally(() => { serialReconnectTask = undefined; });
+    return serialReconnectTask;
+  }
+  async function requestRestart(type = 'provision.restart') {
+    expectedRestartUntil = Date.now() + 30000;
+    const response = await send({type});
+    setTimeout(() => {
+      if (transport === 'serial' && serialWriter)
+        send({type:'provision.get'}).then(() => { expectedRestartUntil = 0; }).catch(() => {});
+    }, 3500);
+    return response;
+  }
   serialConnect.onclick = async () => {
     try {
       if (!isSecureContext) throw new Error('Web SerialにはlocalhostまたはHTTPSが必要です');
       if (!navigator.serial) throw new Error('Web Serial非対応です。Windows版ChromeまたはEdgeを使用してください');
       const port = await navigator.serial.requestPort();
-      connecting('USBシリアル接続中…'); resetParser();
-      await port.open({baudRate:115200, dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:4096});
-      serialPort = port;
-      if (!port.readable || !port.writable) throw new Error('シリアル入出力を開けません');
-      try { await port.setSignals({dataTerminalReady:false, requestToSend:false}); } catch (error) { append('WARN: 制御信号を設定できません: ' + errorText(error)); }
-      serialWriter = port.writable.getWriter(); serialReadTask = readSerial(port); transport = 'serial';
-      const info = port.getInfo ? port.getInfo() : {};
-      const ids = info.usbVendorId === undefined ? '' : ' (' + info.usbVendorId.toString(16).padStart(4,'0') + ':' + info.usbProductId.toString(16).padStart(4,'0') + ')';
-      connected('USBシリアル接続済み' + ids); append('USBシリアルを115200 baudで開きました。');
-      await new Promise(resolve => setTimeout(resolve, 2500));
-      await send({type:'provision.get'});
+      await openSerial(port);
     } catch (error) {
       await closeSerial();
       if (error && error.name === 'NotFoundError') append('USBデバイスの選択をキャンセルしました。');
@@ -1232,7 +1336,7 @@ const PROVISION_HTML = `<!doctype html>
     }
   };
   disconnect.onclick = async () => {
-    const active = transport; transport = undefined; enabled(false);
+    expectedRestartUntil = 0; const active = transport; transport = undefined; enabled(false);
     if (active === 'serial') await closeSerial();
     else if (active === 'ble') await closeBLE();
     disconnected();
@@ -1241,15 +1345,22 @@ const PROVISION_HTML = `<!doctype html>
     try {
       const wifi = {ssid:ssid.value}; const tailscale = {}; const config = {wifi, hubURL:hub.value};
       if (password.value) wifi.password = password.value;
-      if (auth.value) { tailscale.authKey = auth.value; config.tailscale = tailscale; }
+      if (clearAuth.checked) { tailscale.authKey = null; config.tailscale = tailscale; }
+      else if (auth.value) { tailscale.authKey = auth.value; config.tailscale = tailscale; }
       await send({type:'provision.set', config});
+      append('設定を保存しました。再起動します。');
+      await requestRestart();
     } catch (error) { append('ERROR: ' + errorText(error)); }
   };
   document.querySelector('#read').onclick = () => send({type:'provision.get'}).catch(error => append('ERROR: ' + errorText(error)));
-  document.querySelector('#restart').onclick = () => send({type:'provision.restart'}).catch(error => append('ERROR: ' + errorText(error)));
+  document.querySelector('#restart').onclick = () => requestRestart().catch(error => append('ERROR: ' + errorText(error)));
   document.querySelector('#clear').onclick = () => {
     if (confirm('保存済みNVS設定を消去し、ファームウェア初期値へ戻しますか？'))
       send({type:'provision.clear'}).catch(error => append('ERROR: ' + errorText(error)));
+  };
+  document.querySelector('#tailnet-reset').onclick = () => {
+    if (confirm('Tailnet identityと保存済みauth keyを消去して再登録します。管理画面の旧端末はofflineのまま残る場合があります。続行しますか？'))
+      requestRestart('provision.tailnet.reset').catch(error => append('ERROR: ' + errorText(error)));
   };
   if (!isSecureContext || !navigator.serial) serialConnect.title = 'Web SerialにはWindows版Chrome/EdgeのlocalhostまたはHTTPSが必要です';
 </script></main></body></html>`;

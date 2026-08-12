@@ -23,8 +23,12 @@ function Resolve-Program([string]$Name, [string[]]$FallbackPaths) {
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $serverPath = Join-Path $repositoryRoot "tools\camera-server.ts"
+$qrScriptPath = Join-Path $repositoryRoot "tools\vendor\qrcode.js"
 if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
     throw "Camera server was not found: $serverPath"
+}
+if (-not (Test-Path -LiteralPath $qrScriptPath -PathType Leaf)) {
+    throw "Local QR encoder was not found: $qrScriptPath"
 }
 
 $deno = Resolve-Program "deno.exe" @(
@@ -54,7 +58,7 @@ try {
 
     Write-Host "Starting Stack-chan camera hub on $BindAddress`:$Port"
     Write-Host "Persistent state: $StateDirectory"
-    & $deno run --allow-net "--allow-read=$StateDirectory" `
+    & $deno run --allow-net "--allow-read=$StateDirectory,$qrScriptPath" `
         "--allow-write=$StateDirectory" $serverPath $Port $BindAddress `
         "--state-dir=$StateDirectory"
     if ($LASTEXITCODE -ne 0) {

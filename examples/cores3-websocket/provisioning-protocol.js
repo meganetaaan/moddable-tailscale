@@ -7,6 +7,8 @@ export default class ProvisioningProtocol {
 		this.config = options.config;
 		this.onChanged = options.onChanged;
 		this.onBLERequested = options.onBLERequested;
+		this.onTailnetResetRequested = options.onTailnetResetRequested;
+		this.getRuntime = options.getRuntime;
 		this.buffer = "";
 	}
 
@@ -41,8 +43,10 @@ export default class ProvisioningProtocol {
 		}
 		const response = {type: "provision.ack", requestId: request.requestId, command: request.type};
 		try {
-			if (request.type === "provision.get")
+			if (request.type === "provision.get") {
 				response.config = this.config.summary();
+				response.runtime = this.getRuntime?.();
+			}
 			else if (request.type === "provision.set") {
 				response.config = this.config.save(request.config);
 				response.restartRequired = true;
@@ -57,12 +61,16 @@ export default class ProvisioningProtocol {
 				this.onBLERequested?.();
 			else if (request.type === "provision.restart")
 				response.restarting = true;
+			else if (request.type === "provision.tailnet.reset")
+				response.restarting = true;
 			else
 				throw new RangeError("unknown provisioning command");
 			response.ok = true;
 			this.send(send, response);
 			if (request.type === "provision.restart")
 				Timer.set(() => this.config.restart(), 500);
+			else if (request.type === "provision.tailnet.reset")
+				Timer.set(() => this.onTailnetResetRequested?.(), 500);
 		}
 		catch (error) {
 			response.ok = false;

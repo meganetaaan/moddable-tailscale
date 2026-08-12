@@ -23,6 +23,8 @@ JavaScript側には、送信TCPをWHATWG Streams、WebSocketStream用ECMA-419ソ
 
 TCPの`listen()`と`accept()`、複数TCP接続、複数UDPソケット、IPv6、subnet router、exit node、Tailscale SSH、Serve、Funnelは実装していません。
 既存のModdable HTTP/WebSocketサーバーを100.xアドレスで待ち受けさせる用途には、MicroLinkまたはlwIP netif側の追加実装が必要です。
+control planeはTailscale公式サービスを対象とし、HeadscaleとTailnet Lockには対応していません。
+OAuth Appsの[Device provisioning](https://tailscale.com/docs/features/oauth-apps/device-provisioning)も今回の実装範囲外です。
 
 ## 対象環境
 
@@ -30,7 +32,7 @@ TCPの`listen()`と`accept()`、複数TCP接続、複数UDPソケット、IPv6�
 - ESP-IDF v6.0.2
 - ESP32-S3と8 MB PSRAMを持つM5Stack CoreS3
 - ESP32と4 MB PSRAMを持つM5Stack M5Camera（U017）
-- Tailscale auth keyを発行できるTailnet
+- デバイスを登録できるTailscaleアカウント（tag付き自動登録ではauth keyも必要）
 
 Moddable 9.0.0が要求するESP-IDFの版は`v6.0.2`です。
 この統合は、ESP-IDF 6で削除されたMbed TLS APIをPSA Cryptoへ移行し、DERP TLSで証明書バンドル、ホスト名検証、`VERIFY_REQUIRED`を有効にします。
@@ -52,7 +54,8 @@ cp examples/cores3-websocket/credentials.example.js \
   examples/cores3-websocket/credentials.js
 ```
 
-`credentials.js`へWi-Fiと、カメラ端末用tagを付けたauth keyを設定します。
+`credentials.js`へWi-Fiを設定します。`tailscale.authKey`は任意です。省略すると、初回起動時に
+Tailscale標準のAuthURL認証を開始します。
 この値は初回起動用のfallbackで、同じfirmwareを複数台へ書き込めます。
 各個体のIDはeFuse MACからCoreS3では`cores3-xxxxxxxxxxxx`、M5Cameraでは
 `m5camera-xxxxxxxxxxxx`、Tailnet上の名前はいずれも`stackcam-xxxxxx`として
@@ -60,9 +63,13 @@ cp examples/cores3-websocket/credentials.example.js \
 
 中央PCのTailscaleマシン名は`stackchan-hub`にします。MagicDNSを有効にすると、
 各カメラ端末は固定URL `ws://stackchan-hub:8080/camera`へ接続するため、中央PCの
-100.xアドレスが変わってもfirmwareの再設定は不要です。Tailnet policyでは、たとえば
+100.xアドレスが変わってもfirmwareの再設定は不要です。
+
+AuthURLで登録したカメラは、ログインしたユーザーが所有する端末です。収録policyの
+`autogroup:member` grantによってHubのTCP 8080へ接続できますが、そのユーザーに許可された
+他のアクセス権も継承します。カメラをHubだけへ制限したい常設配備では、たとえば
 [`tag:stackchan-camera`](https://tailscale.com/docs/features/tags)のownerを管理者に限定し、
-CoreS3用auth keyへこのtagを付与して、
+端末用auth keyへこのtagを付与して、
 `tag:stackchan-camera`から中央PCのTCP 8080だけを許可します。同一imageへkeyも埋め込んで
 複数台へ配る場合は、有効期限を短くしたreusable tagged keyが必要です。USB/BLEで
 個体ごとに設定する運用ならone-off tagged keyを推奨します。
@@ -76,8 +83,8 @@ policy validatorでテストが通ることを確認してから保存してく�
 
 中央PCへのtag付与は管理画面のMachines/Devicesから`tag:stackchan-hub`を追加するか、
 PowerShellで`tailscale login --advertise-tags=tag:stackchan-hub`を実行して再認証します。
-CoreS3は後述の端末別provisioningで`tag:stackchan-camera`付きauth keyを使うため、
-登録と同時にtag identityになります。
+CoreS3/M5Cameraへ後述の端末別provisioningで`tag:stackchan-camera`付きauth keyを設定した場合は、
+登録と同時にtag identityになります。auth keyを省略した通常のAuthURL登録ではuser identityのままです。
 
 Tagを付けるとnodeのuser identityがtag identityへ置き換わるため、中央PCを
 user-owned deviceのままにする場合は`tag:stackchan-hub`を付けません。
@@ -173,7 +180,7 @@ M5Camera（U017）はCoreS3と同じcamera hub protocol、Tailnet transport、�
 
 OV2640から320x240 JPEGを直接取得するためsoftware再encodeは行わず、Hubからの要求に応じて
 1〜8 fpsで送信します。画面がないため状態はserial traceと基板上のGPIO14 LEDへ出力し、
-BLE provisioningは含めません。LEDは接続処理中に500 ms間隔で点滅し、Wi-Fi、Tailnet、
+BLE provisioningは含めません。LEDは接続処理中に500 ms間隔、AuthURL/承認待ちは1秒間隔で点滅し、Wi-Fi、Tailnet、
 WebSocket、映像送信がすべて確立すると点灯します。エラーまたは切断時は125 ms間隔で点滅し、
 `device.identify`を受信したときも指定時間だけ125 ms間隔で点滅してから現在状態へ戻ります。
 CP2104のUSB serial（UART0、115200 baud）からCoreS3と同じJSON provisioning protocolを使用できます。
@@ -195,25 +202,38 @@ release firmwareへ個体設定を書き込む場合は、後述の`provision-us
 
 ### 個体設定
 
-設定はNVSへ保存され、`credentials.js`より優先されます。Release firmwareでは
-USB Serial/JTAGを使ってWindows PowerShellから設定できます。auth keyをコマンド履歴へ
-残さないよう環境変数で渡します。
+設定はversion 1のままNVSへ保存され、`credentials.js`より優先されます。Release firmwareでは
+USB Serial/JTAGを使ってWindows PowerShellからWi-FiとHub URLだけを設定できます。
 
 ```powershell
-$env:STACKCHAN_AUTH_KEY = "tskey-auth-..."
 ./scripts/provision-usb.ps1 set -Port COM4 `
   -WifiSsid "YOUR_WIFI_SSID" -WifiPassword "YOUR_WIFI_PASSWORD"
 ./scripts/provision-usb.ps1 get -Port COM4
 ```
 
 `get`はSSID、auth key/passwordの設定有無、device ID、hub URLだけを返し、秘密値は返しません。
-`clear`でNVS設定を削除してfirmware内fallbackへ戻し、`restart`で再起動できます。
+`clear`でNVS設定を削除してfirmware内fallbackへ戻し、`restart`で再起動できます。保存済みauth keyだけを
+削除するには`set -ClearAuthKey`、Wi-Fi/Hub設定を残してTailnet identityを消すには
+`tailnet-reset`を使います。後者では管理画面の旧端末がofflineのまま残る場合があります。
 
 Windows版ChromeまたはEdgeで`http://localhost:8080/provision`を開くと、同じ設定を
 Web Serialだけで完結できます。「USBシリアルで接続」を押してM5CameraのCP2104 COM portを
 選択してください。WSLへUSB接続中、書き込み中、またはserial monitor起動中はWindowsブラウザーから
 COM portを開けないため、先にそれらを終了またはdetachします。空欄のWi-Fi passwordと
 Tailscale auth keyは既存値を保持し、ブラウザーには秘密値そのものを返しません。
+
+保存ACK後は自動的に再起動し、許可済みWeb Serial portへ最大30秒間再接続します。auth keyが
+設定されていなければ、CoreS3はAuthURLのQRを画面へ表示します。M5Cameraでは再接続後の設定ページに
+同じURLの認証ボタンと、ブラウザー内で生成したローカルQRを表示します。CoreS3はUSB/BLE設定ページ向けにも
+任意の`authQR` bit matrixを返します。QR生成に外部サービスやHub APIは使わず、AuthURLを第三者へ
+送信しません。Tailnet側で端末承認が必要な
+policyでは、QRを消して管理画面での承認待ちを表示します。`Tailnet登録をやり直す`はWi-Fi/Hub設定を
+保持したままauth keyとidentityを消去し、新しいAuthURLを発行します。
+
+provisioning protocolの`provision.get` ACKには
+`runtime.tailnet: {state, authURL?, authQR?, error?}`が付きます。状態が変化したときは同じruntimeを
+`provision.status`としてUSB/BLEへ通知します。`authURL`と`authQR`は`needs-auth`の間だけUIに表示し、
+保存や通常ログへの出力は行いません。
 
 端末ごとに再利用不可のtagged auth keyを自動発行して、そのままUSB設定する場合は、Tailscale
 管理画面でOAuth clientを作成します。`auth_keys`のwrite scopeと
@@ -262,16 +282,28 @@ Tailnetを開始する前に、TLS証明書検証に使える時刻をSNTPなど
 import Tailnet from "tailscale";
 
 const tailnet = new Tailnet({
-  authKey: "tskey-auth-...",
   deviceName: "stackchan-cores3",
   priorityPeer: "100.64.0.1",
   connectTimeout: 60_000,
+  onAuthRequired(url) {
+    showLocalQRCode(url);
+  },
 });
 
 await tailnet.start();
 trace(`address=${tailnet.vpnAddress}\n`);
 trace(JSON.stringify(tailnet.peers), "\n");
 ```
+
+`authKey`は任意です。省略時は`state`が`needs-auth`となり、`authURL`と
+`onAuthRequired(url)`でTailscaleの認証URLを取得できます。URLが変わらない限りcallbackは
+再通知されません。端末承認が必要な場合は`needs-approval`になります。`start()`は接続完了まで
+pendingのままですが、この2状態でユーザーを待つ時間は`connectTimeout`へ算入しません。
+この処理はTailscaleの
+[`RegisterRequest.Followup` / `RegisterResponse.AuthURL`](https://github.com/tailscale/tailscale/blob/main/tailcfg/tailcfg.go)
+を使い、同じnode keyで新しいcontrol接続から認証完了を確認します。
+node keyが期限切れになるとactive transportを閉じて`reconnecting`へ移り、古いnode keyを
+`OldNodeKey`として保持したまま新しいAuthURL登録へ進みます。通常再起動では保存済みidentityを再利用します。
 
 `priorityPeer`は、最大8 peerの固定テーブルが埋まった場合にも保持したい接続先です。
 
@@ -319,7 +351,9 @@ Wi-Fiが別の経路へ復帰した場合は`await tailnet.rebind()`を呼び、
 
 ## セキュリティ
 
-auth keyは[`Tailscaleの公式ガイド`](https://tailscale.com/docs/features/access-control/auth-keys)で発行し、必要最小限のtagとACLを割り当ててください。
+AuthURL登録はバックエンド資格情報を不要にしますが、端末はログインユーザー所有となり、そのユーザーの
+grantsを継承します。最小権限の無人端末には、[`Tailscaleの公式ガイド`](https://tailscale.com/docs/features/access-control/auth-keys)で
+発行したtag付きauth keyを設定し、必要最小限のACLを割り当ててください。
 可能ならone-off keyを使い、登録後に再利用できない状態にしてください。
 `credentials.js`はファームウェアへ埋め込まれるため、Gitから除外してもflashを読める攻撃者から秘密を守る仕組みにはなりません。
 漏えいが疑われるauth keyはTailnet管理画面で失効させてください。
@@ -329,7 +363,7 @@ DERPのTLSはESP-IDF証明書バンドルで検証しますが、WireGuard内の
 
 ## 検証
 
-依存commit、パッチの再実行性、DERP TLS設定、Noise AEAD固定ベクトル、manifest JSON、auth keyの混入を検査します。
+依存commit、パッチの再実行性、DERP TLS設定、Noise AEAD固定ベクトル、Register codec fixture、manifest JSON、auth keyの混入を検査します。
 
 ```sh
 ./scripts/verify.sh

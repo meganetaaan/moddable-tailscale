@@ -4,7 +4,7 @@ export default Object.freeze({
 		password: "YOUR_WIFI_PASSWORD",
 	},
 	tailscale: {
-		authKey: "tskey-auth-REPLACE_ME",
+		// authKey: "tskey-auth-REPLACE_ME", // Optional automated/tagged registration
 		// priorityPeer: "100.64.0.1",
 	},
 });

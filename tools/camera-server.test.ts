@@ -112,11 +112,22 @@ async function withServer(
 const JPEG = new Uint8Array([0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9]);
 const SECOND_JPEG = new Uint8Array([0xff, 0xd8, 0x03, 0x04, 0xff, 0xd9]);
 
-Deno.test("serves syntactically valid BLE and Web Serial provisioning JavaScript", async () => {
+Deno.test("serves complete local-only AuthURL provisioning JavaScript", async () => {
   await withServer(async (baseURL) => {
     const response = await fetch(`${baseURL}/provision`);
     assert(response.ok, "BLE provisioning page did not return 200");
     const html = await response.text();
+    const qrResponse = await fetch(`${baseURL}/assets/qrcode.js`);
+    assert(qrResponse.ok, "local QR encoder did not return 200");
+    const qrScript = await qrResponse.text();
+    const generatedQR = new Function(
+      `${qrScript}; const code = qrcode(0, "M"); code.addData("https://login.tailscale.com/a/test", "Byte"); code.make(); return {size: code.getModuleCount(), corner: code.isDark(0, 0)};`,
+    )();
+    assert(
+      Number.isInteger(generatedQR.size) && generatedQR.size >= 21 &&
+        generatedQR.corner,
+      "local QR encoder could not encode an AuthURL",
+    );
     const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert(script, "provisioning script is missing");
     new Function(script);
@@ -127,6 +138,19 @@ Deno.test("serves syntactically valid BLE and Web Serial provisioning JavaScript
         script.includes("requestPort") &&
         script.includes("baudRate:115200") &&
         script.includes("@stackchan ") &&
+        script.includes("pending.get(message.requestId)") &&
+        script.includes("await send({type:'provision.set'") &&
+        script.includes("await requestRestart()") &&
+        script.includes("expectedRestartUntil = Date.now() + 30000") &&
+        script.includes("navigator.serial.getPorts()") &&
+        script.includes("provision.tailnet.reset") &&
+        script.includes("tailscale.authKey = null") &&
+        script.includes("authQR.getContext('2d')") &&
+        script.includes("qrcode(0, 'M')") &&
+        html.includes('<script src="/assets/qrcode.js"></script>') &&
+        qrScript.includes("var qrcode=") &&
+        !/fetch\s*\(/.test(script) &&
+        !/<img\b/i.test(html) &&
         html.includes("Bluetoothとデバイス"),
       "provisioning transport logic is incomplete",
     );
