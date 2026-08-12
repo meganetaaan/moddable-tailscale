@@ -69,6 +69,7 @@
 		"device-config/idf/*": "$(IDF_PATH)/components/esp_driver_uart/include/driver/uart.h",
 		"m5camera-config-native/*": "../cores3-websocket/native/device-config.c",
 		"provisioning-protocol": "../cores3-websocket/provisioning-protocol",
+		"qrcode": "./disabled-qrcode",
 		"status-display": "./status-display",
 		"stackcam-websocket-stream": "../cores3-websocket/websocket-stream",
 		"usb-provisioning": "../cores3-websocket/usb-provisioning"

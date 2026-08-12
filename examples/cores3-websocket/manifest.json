@@ -20,6 +20,8 @@
 		"$(MODDABLE)/examples/manifest_base.json",
 		"$(MODDABLE)/examples/manifest_net.json",
 		"$(MODDABLE)/examples/manifest_commodetto.json",
+		"$(MODDABLE)/modules/data/qrcode/manifest.json",
+		"$(MODDABLE)/modules/commodetto/qrcode/manifest.json",
 		"$(MODDABLE)/modules/network/ble/manifest_server.json",
 		"$(MODDABLE)/modules/io/imagein/camera/manifest.json",
 		"$(MODDABLE)/modules/web/streams/websocket/manifest.json",

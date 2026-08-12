@@ -1,5 +1,6 @@
 import Poco from "commodetto/Poco";
 import parseBMF from "commodetto/parseBMF";
+import qrCode from "qrcode";
 import Resource from "Resource";
 import Timer from "timer";
 
@@ -48,7 +49,7 @@ export default class StatusDisplay {
 			return;
 		row.text = text;
 		row.tone = tone;
-		if (this.overlay)
+		if (this.overlay || this.authURL || this.approvalPending)
 			return;
 		this.drawRow(rowDefinitions.findIndex(([name]) => name === key));
 	}
@@ -71,7 +72,45 @@ export default class StatusDisplay {
 		this.message("IDENTIFY", deviceId, "info", duration);
 	}
 
+	tailnetError(detail) {
+		this.message("TAILNET ERROR", detail, "error", 10_000);
+	}
+
+	authRequired(url) {
+		if (this.overlayTimer) {
+			Timer.clear(this.overlayTimer);
+			this.overlayTimer = undefined;
+		}
+		this.overlay = undefined;
+		this.approvalPending = false;
+		this.authURL = String(url);
+		this.drawAuth();
+	}
+
+	approvalRequired() {
+		this.authURL = undefined;
+		this.overlay = undefined;
+		this.approvalPending = true;
+		this.drawApproval();
+	}
+
+	clearAuth() {
+		if (!this.authURL && !this.approvalPending)
+			return;
+		this.authURL = undefined;
+		this.approvalPending = false;
+		this.draw();
+	}
+
 	draw() {
+		if (this.authURL) {
+			this.drawAuth();
+			return;
+		}
+		if (this.approvalPending) {
+			this.drawApproval();
+			return;
+		}
 		if (this.overlay) {
 			this.drawOverlay();
 			return;
@@ -85,6 +124,50 @@ export default class StatusDisplay {
 		render.end();
 		for (let index = 0; index < rowDefinitions.length; index++)
 			this.drawRow(index);
+	}
+
+	drawAuth() {
+		const render = this.render;
+		const white = render.makeColor(255, 255, 255);
+		const black = render.makeColor(0, 0, 0);
+		const panel = this.colors.header;
+		let qr;
+		try {
+			qr = qrCode({input: this.authURL, maxVersion: 20});
+		}
+		catch {
+			this.approvalPending = true;
+			this.authURL = undefined;
+			this.drawApproval("AUTH URL TOO LONG");
+			return;
+		}
+		const area = Math.min(216, render.height - 16);
+		const pixels = Math.max(1, Math.idiv(area - 16, qr.size));
+		const size = qr.size * pixels;
+		const x = 8 + ((area - size) >> 1);
+		const y = (render.height - size) >> 1;
+		render.begin();
+		render.fillRectangle(white, 0, 0, area + 16, render.height);
+		render.fillRectangle(panel, area + 16, 0, render.width - area - 16, render.height);
+		render.drawQRCode(qr, x, y, pixels, black);
+		render.drawText("TAILSCALE", this.font, this.colors.text, area + 24, 58);
+		render.drawText("SCAN", this.font, this.colors.ok, area + 24, 98);
+		render.drawText("TO LOGIN", this.font, this.colors.text, area + 24, 132);
+		render.end();
+	}
+
+	drawApproval(title = "APPROVAL REQUIRED") {
+		const render = this.render;
+		const colors = this.colors;
+		const heading = this.fitText(title, render.width - 24);
+		const detail = "Approve in Tailscale admin";
+		render.begin();
+		render.fillRectangle(colors.info, 0, 0, render.width, render.height);
+		render.drawText(heading, this.font, colors.text,
+			(render.width - render.getTextWidth(heading, this.font)) >> 1, 80);
+		render.drawText(detail, this.font, colors.text,
+			(render.width - render.getTextWidth(detail, this.font)) >> 1, 122);
+		render.end();
 	}
 
 	drawOverlay() {

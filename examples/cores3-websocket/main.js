@@ -9,11 +9,12 @@ import BLEProvisioning from "ble-provisioning";
 import CameraStream from "camera-stream";
 import DeviceConfig from "device-config";
 import ProvisioningProtocol from "provisioning-protocol";
+import qrCode from "qrcode";
 import StatusDisplay from "status-display";
 import USBProvisioning from "usb-provisioning";
 
 const PROTOCOL_VERSION = 1;
-const FIRMWARE_VERSION = "0.3.2";
+const FIRMWARE_VERSION = "0.4.0";
 const STACKCAM_CONFIG = config.stackcam ?? {};
 const DEVICE_MODEL = STACKCAM_CONFIG.model ?? "m5stack-cores3";
 // Values from mc/config can live in the read-only XS archive. JSON.stringify
@@ -42,6 +43,10 @@ let tailnetNeedsRebind = false;
 let heartbeatWatchdogSocket;
 let cameraSessionTask;
 let bleProvisioning;
+let usbProvisioning;
+let cachedAuthQR;
+let cachedAuthQRURL;
+let tailnetErrorMessage;
 const status = new StatusDisplay();
 const deviceConfig = new DeviceConfig({devicePrefix: STACKCAM_CONFIG.devicePrefix ?? "cores3"});
 const cameraStream = new CameraStream({
@@ -70,8 +75,66 @@ const cameraStream = new CameraStream({
 	},
 });
 
+function provisioningRuntime() {
+	const state = tailnet?.state ?? "idle";
+	const result = {tailnet: {state}};
+	if ((state === "needs-auth") && tailnet?.authURL) {
+		result.tailnet.authURL = tailnet.authURL;
+		if (cachedAuthQRURL !== tailnet.authURL) {
+			const qr = qrCode({input: tailnet.authURL, maxVersion: 20});
+			if (qr) {
+				const cells = new Uint8Array(qr);
+				const bytes = new Uint8Array((cells.length + 7) >> 3);
+				for (let index = 0; index < cells.length; index++) {
+					if (cells[index])
+						bytes[index >> 3] |= 0x80 >> (index & 7);
+				}
+				let bits = "";
+				for (const byte of bytes)
+					bits += byte.toString(16).padStart(2, "0");
+				cachedAuthQR = {size: qr.size, bits};
+			}
+			else
+				cachedAuthQR = undefined;
+			cachedAuthQRURL = tailnet.authURL;
+		}
+		if (cachedAuthQR)
+			result.tailnet.authQR = cachedAuthQR;
+	}
+	else if (!tailnet?.authURL) {
+		cachedAuthQR = cachedAuthQRURL = undefined;
+	}
+	if ((state === "error") && tailnetErrorMessage)
+		result.tailnet.error = tailnetErrorMessage;
+	return result;
+}
+
+function publishProvisioningStatus() {
+	const message = {type: "provision.status", runtime: provisioningRuntime()};
+	usbProvisioning?.write(message);
+	bleProvisioning?.notify(`${JSON.stringify(message)}\n`);
+}
+
+async function resetTailnetIdentity() {
+	try {
+		deviceConfig.clearAuthKey();
+		if (tailnet) {
+			await tailnet.close();
+			tailnet = undefined;
+		}
+		if (!Tailnet.factoryReset())
+			throw new Error("Tailnet identity reset failed");
+		deviceConfig.restart();
+	}
+	catch (error) {
+		trace(`Tailnet identity reset failed: ${error}\n`);
+		status.message("RESET FAILED", String(error.message ?? error), "error", 10_000);
+	}
+}
+
 const provisioningProtocol = new ProvisioningProtocol({
 	config: deviceConfig,
+	getRuntime: provisioningRuntime,
 	onChanged() {
 		status.message("CONFIG SAVED", "Restart to apply", "ok", 8_000);
 	},
@@ -81,10 +144,13 @@ const provisioningProtocol = new ProvisioningProtocol({
 		else
 			status.message("BLE DISABLED", "Use USB serial", "error", 5_000);
 	},
+	onTailnetResetRequested() {
+		void resetTailnetIdentity();
+	},
 });
 
 if (USB_PROVISIONING_ENABLED)
-	new USBProvisioning({config: deviceConfig, protocol: provisioningProtocol});
+	usbProvisioning = new USBProvisioning({config: deviceConfig, protocol: provisioningProtocol});
 
 function startBLEProvisioning() {
 	if (bleProvisioning) {
@@ -352,17 +418,31 @@ async function startTailnet() {
 	starting = true;
 	try {
 		if (!tailnet) {
-			tailnet = new Tailnet({
+				tailnet = new Tailnet({
 				...deviceConfig.tailscale,
 				onStateChanged(state) {
 					trace(`Tailnet state: ${state}\n`);
+					if (state !== "error")
+						tailnetErrorMessage = undefined;
 					status.set("tailnet", String(state).toUpperCase(), state === "connected" ? "ok" : "pending");
+					if (state === "needs-approval")
+						status.approvalRequired();
+					else if (state !== "needs-auth")
+						status.clearAuth();
+					publishProvisioningStatus();
 					if ((state === "connected") && wifiConnected && !webSocket)
 						scheduleTailnetRecovery();
 				},
+				onAuthRequired(url) {
+					status.authRequired(url);
+					publishProvisioningStatus();
+				},
 				onError(error) {
-					trace(`Tailnet error: ${error.message}\n`);
+					tailnetErrorMessage = error.message;
+					trace("Tailnet error\n");
 					status.set("tailnet", "ERROR", "error");
+					status.tailnetError?.(error.message);
+					publishProvisioningStatus();
 				},
 			});
 			await tailnet.start();
@@ -388,7 +468,7 @@ async function startTailnet() {
 		void openWebSocket();
 	}
 	catch (error) {
-		trace(`Tailnet startup failed: ${error}\n`);
+		trace("Tailnet startup failed\n");
 		status.set("tailnet", "START FAILED", "error");
 		scheduleTailnetRecovery(5_000);
 	}

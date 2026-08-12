@@ -1,11 +1,12 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("get", "set", "clear", "restart", "ble")]
+    [ValidateSet("get", "set", "clear", "restart", "ble", "tailnet-reset")]
     [string]$Command = "get",
     [string]$Port = "COM4",
     [string]$WifiSsid,
     [string]$WifiPassword = "",
     [string]$AuthKey = $env:STACKCHAN_AUTH_KEY,
+    [switch]$ClearAuthKey,
     [string]$HubUrl = "ws://stackchan-hub:8080/camera",
     [switch]$NoRestart
 )
@@ -22,17 +23,20 @@ function New-ProvisionRequest([string]$Name) {
             if ([string]::IsNullOrWhiteSpace($WifiSsid)) {
                 throw "-WifiSsid is required for set"
             }
-            if ([string]::IsNullOrWhiteSpace($AuthKey)) {
-                throw "Set STACKCHAN_AUTH_KEY or pass -AuthKey for set"
+            $config = @{
+                wifi = @{ ssid = $WifiSsid; password = $WifiPassword }
+                hubURL = $HubUrl
+            }
+            if ($ClearAuthKey) {
+                $config.tailscale = @{ authKey = $null }
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($AuthKey)) {
+                $config.tailscale = @{ authKey = $AuthKey }
             }
             return @{
                 type = "provision.set"
                 requestId = $requestId
-                config = @{
-                    wifi = @{ ssid = $WifiSsid; password = $WifiPassword }
-                    tailscale = @{ authKey = $AuthKey }
-                    hubURL = $HubUrl
-                }
+                config = $config
             }
         }
         "clear" {
@@ -43,6 +47,9 @@ function New-ProvisionRequest([string]$Name) {
         }
         "ble" {
             return @{ type = "provision.ble.start"; requestId = $requestId }
+        }
+        "tailnet-reset" {
+            return @{ type = "provision.tailnet.reset"; requestId = $requestId }
         }
     }
 }

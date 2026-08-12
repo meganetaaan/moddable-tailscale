@@ -51,6 +51,13 @@ fi
 	-o "${VERIFY_TMP}/noise_aead_test"
 "${VERIFY_TMP}/noise_aead_test"
 
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+	-I"${MICROLINK_ROOT}/components/microlink/include" \
+	"${PROJECT_ROOT}/tests/register_codec_test.c" \
+	"${MICROLINK_ROOT}/components/microlink/src/ml_register_codec.c" \
+	-o "${VERIFY_TMP}/register_codec_test"
+"${VERIFY_TMP}/register_codec_test"
+
 node -e 'for (const file of process.argv.slice(1)) JSON.parse(require("fs").readFileSync(file))' \
 	"${PROJECT_ROOT}/manifest.json" \
 	"${PROJECT_ROOT}/examples/cores3-websocket/manifest.json" \

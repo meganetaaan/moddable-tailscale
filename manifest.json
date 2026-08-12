@@ -19,6 +19,7 @@
 			"./.deps/microlink/components/microlink/src/ml_net_io.c",
 			"./.deps/microlink/components/microlink/src/ml_noise.c",
 			"./.deps/microlink/components/microlink/src/ml_peer_nvs.c",
+			"./.deps/microlink/components/microlink/src/ml_register_codec.c",
 			"./.deps/microlink/components/microlink/src/ml_stun.c",
 			"./.deps/microlink/components/microlink/src/ml_tcp.c",
 			"./.deps/microlink/components/microlink/src/ml_udp.c",

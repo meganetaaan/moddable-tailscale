@@ -22,9 +22,11 @@ function validate(value) {
 		throw new RangeError("invalid config sections");
 	requireString(value.wifi.ssid, "Wi-Fi SSID", 32);
 	requireString(value.wifi.password ?? "", "Wi-Fi password", 63, true);
-	const authKey = requireString(value.tailscale.authKey, "Tailscale auth key", 160);
-	if (!authKey.startsWith("tskey-auth-"))
-		throw new RangeError("invalid Tailscale auth key");
+	if (value.tailscale.authKey !== undefined) {
+		const authKey = requireString(value.tailscale.authKey, "Tailscale auth key", 160);
+		if (!authKey.startsWith("tskey-auth-"))
+			throw new RangeError("invalid Tailscale auth key");
+	}
 	const hubURL = requireString(value.hubURL, "hub URL", 160);
 	if (!/^ws:\/\/[a-z0-9.-]+(?::\d{1,5})?\/camera$/i.test(hubURL))
 		throw new RangeError("hub URL must be ws://<MagicDNS-name>:<port>/camera");
@@ -43,12 +45,12 @@ function defaults() {
 			ssid: credentials.wifi.ssid,
 			password: credentials.wifi.password ?? "",
 		},
-		tailscale: {
-			authKey: credentials.tailscale.authKey,
-		},
+		tailscale: {},
 		hubURL: DEFAULT_HUB_URL,
 	};
-	if (credentials.tailscale.priorityPeer)
+	if (credentials.tailscale?.authKey)
+		result.tailscale.authKey = credentials.tailscale.authKey;
+	if (credentials.tailscale?.priorityPeer)
 		result.tailscale.priorityPeer = credentials.tailscale.priorityPeer;
 	return validate(result);
 }
@@ -82,9 +84,10 @@ export default class DeviceConfig {
 
 	get tailscale() {
 		const result = {
-			authKey: this.value.tailscale.authKey,
 			deviceName: this.deviceName,
 		};
+		if (this.value.tailscale.authKey)
+			result.authKey = this.value.tailscale.authKey;
 		if (this.value.tailscale.priorityPeer)
 			result.priorityPeer = this.value.tailscale.priorityPeer;
 		return result;
@@ -93,16 +96,20 @@ export default class DeviceConfig {
 	save(patch) {
 		if (!isObject(patch))
 			throw new TypeError("config must be an object");
+		const tailscalePatch = isObject(patch.tailscale) ? patch.tailscale : {};
+		const tailscale = {
+			...this.value.tailscale,
+			...tailscalePatch,
+		};
+		if (("authKey" in tailscalePatch) && (tailscalePatch.authKey === null))
+			delete tailscale.authKey;
 		const next = {
 			version: CONFIG_VERSION,
 			wifi: {
 				...this.value.wifi,
 				...(isObject(patch.wifi) ? patch.wifi : {}),
 			},
-			tailscale: {
-				...this.value.tailscale,
-				...(isObject(patch.tailscale) ? patch.tailscale : {}),
-			},
+			tailscale,
 			hubURL: patch.hubURL ?? this.value.hubURL,
 		};
 		validate(next);
@@ -117,6 +124,10 @@ export default class DeviceConfig {
 		this.value = defaults();
 		this.persisted = false;
 		return this.summary();
+	}
+
+	clearAuthKey() {
+		return this.save({tailscale: {authKey: null}});
 	}
 
 	summary() {

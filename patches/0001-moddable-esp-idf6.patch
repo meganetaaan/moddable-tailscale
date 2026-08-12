@@ -1,7 +1,139 @@
+diff --git a/components/microlink/CMakeLists.txt b/components/microlink/CMakeLists.txt
+index 35b0bdaba3226c1c248fd50f0891fff4529ffe04..92cb54d7e512e04a9ed591cabebe3b3509e4846d 100644
+--- a/components/microlink/CMakeLists.txt
++++ b/components/microlink/CMakeLists.txt
+@@ -9,8 +9,9 @@ set(SRCS
+     "src/ml_h2.c"
+     "src/ml_udp.c"
+     "src/ml_tcp.c"
+-    "src/ml_peer_nvs.c"
+-    "src/nacl_box.c"
++    "src/ml_peer_nvs.c"
++    "src/ml_register_codec.c"
++    "src/nacl_box.c"
+     "src/x25519.c"
+     "src/ml_zerocopy.c"
+     "src/ml_cellular.c"
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+index f974c67ddd1b118a961224644015278ee4326d09..f0feaf0a2fec025b599ea858b4434b0ccda8f5db 100644
+--- a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+@@ -5,9 +5,9 @@
+ 
+ #include "wireguard-platform.h"
+ #include "esp_random.h"
+-#include "esp_timer.h"
+ #include "lwip/sys.h"
+ #include <string.h>
++#include <sys/time.h>
+ 
+ /* ============================================================================
+  * Time Functions
+@@ -20,17 +20,12 @@ uint32_t wireguard_sys_now() {
+ 
+ void wireguard_tai64n_now(uint8_t *output) {
+     // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
+-    // For simplicity, use Unix epoch time
+-    uint64_t now_us = esp_timer_get_time();
+-    uint64_t seconds = now_us / 1000000ULL;
+-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
+-
+-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
+-    static uint64_t last_log_s = 0;
+-    if (seconds - last_log_s >= 5) {
+-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
+-        last_log_s = seconds;
+-    }
++    // WireGuard rejects replayed handshake timestamps. ESP timer uptime resets
++    // on every boot, so use the SNTP-synchronized wall clock instead.
++    struct timeval now;
++    gettimeofday(&now, NULL);
++    uint64_t seconds = (uint64_t)now.tv_sec;
++    uint32_t nanoseconds = (uint32_t)now.tv_usec * 1000;
+ 
+     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)
+     // Add TAI offset: 2^62 + Unix time
 diff --git a/components/microlink/components/wireguard_lwip/src/wireguardif.c b/components/microlink/components/wireguard_lwip/src/wireguardif.c
-index 6627fd0..b947e47 100644
+index 6627fd0f2f92db572ef2b6bcf5b74e4e475a7c0a..1836e94fa2c0e11ab5f017755661343a7946d0d5 100644
 --- a/components/microlink/components/wireguard_lwip/src/wireguardif.c
 +++ b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+@@ -148,38 +148,38 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
+ 				return result;
+ 			}
+ 			WG_DEBUG("[WG_OUT] DERP mem_malloc failed!\n");
+-		
++
+ 			return ERR_MEM;
+ 		}
+ 		// No DERP callback and no direct endpoint - can't send
+ 		WG_DEBUG("[WG_OUT] No DERP callback, returning ERR_RTE\n");
+-	
++
+ 		return ERR_RTE;
+ 	}
+ 
+ 	// In magicsock mode, use external UDP output callback
+ 	if (device->udp_output_fn) {
+ 		WG_DEBUG("[WG_OUT] Using magicsock callback\n");
+-	
++
+ 		// Linearize pbuf chain and send via callback
+ 		uint8_t *data = (uint8_t *)mem_malloc(q->tot_len);
+ 		if (data) {
+ 			WG_DEBUG("[WG_OUT] mem_malloc OK, copying pbuf\n");
+-		
++
+ 			pbuf_copy_partial(q, data, q->tot_len, 0);
+ 			// Convert lwIP IP address to network byte order uint32_t
+ 			uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(&peer->ip));
+ 			WG_DEBUG("[WG_OUT] Calling udp_output_fn, dest_ip=0x%08lx port=%u len=%u\n",
+ 			       (unsigned long)dest_ip, peer->port, (unsigned)q->tot_len);
+-		
++
+ 			err_t result = device->udp_output_fn(dest_ip, peer->port, data, q->tot_len, device->udp_output_ctx);
+ 			WG_DEBUG("[WG_OUT] udp_output_fn returned %d\n", result);
+-		
++
+ 			mem_free(data);
+ 			return result;
+ 		}
+ 		WG_DEBUG("[WG_OUT] mem_malloc FAILED for magicsock!\n");
+-	
++
+ 		return ERR_MEM;
+ 	}
+ 
+@@ -289,10 +289,10 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
+ 
+ 				WG_DEBUG("[WG_TX] Sending encrypted DATA packet: %u bytes, remote_idx=%lu\n",
+ 				       (unsigned)pbuf->tot_len, (unsigned long)hdr->receiver);
+-			
++
+ 				result = wireguardif_peer_output(netif, pbuf, peer);
+ 				WG_DEBUG("[WG_TX] peer_output result=%d\n", result);
+-			
++
+ 
+ 				if (result == ERR_OK) {
+ 					now = wireguard_sys_now();
+@@ -341,7 +341,7 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
+ 	if (peer) {
+ 		WG_DEBUG("[WG_OUTPUT] Found peer, peer_index=%d, valid=%d\n",
+ 		       (int)(peer - device->peers), peer->valid);
+-	
++
+ 		return wireguardif_output_to_peer(netif, q, ipaddr, peer);
+ 	} else {
+ 		WG_DEBUG("[WG_OUTPUT] NO PEER FOUND for %s! Dumping all peers:\n", ipaddr_ntoa(&addr));
+@@ -359,7 +359,7 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
+ 				}
+ 			}
+ 		}
+-	
++
+ 		return ERR_RTE;
+ 	}
+ }
 @@ -539,9 +539,10 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
  								if (dest_ok) {
  									// Send packet to be processed by LWIP
@@ -28,8 +160,84 @@ index 6627fd0..b947e47 100644
  		type,
  		type == 1 ? "INIT" : type == 2 ? "RESP" : type == 3 ? "COOKIE" : type == 4 ? "DATA" : "?",
  		(unsigned)len,
+diff --git a/components/microlink/include/microlink.h b/components/microlink/include/microlink.h
+index 9126a53e7dfb10e97cc73f67cdcb806480f8edbd..6b9dbe4fe1d41dd849497afa822fbd6da5ed2fe6 100644
+--- a/components/microlink/include/microlink.h
++++ b/components/microlink/include/microlink.h
+@@ -24,8 +24,8 @@ extern "C" {
+ typedef struct microlink_s microlink_t;
+ 
+ /* Configuration */
+-typedef struct {
+-    const char *auth_key;       /* Tailscale auth key (tskey-auth-...) */
++typedef struct {
++    const char *auth_key;       /* Optional Tailscale auth key (tskey-auth-...) */
+     const char *device_name;    /* Device hostname on the tailnet */
+     bool enable_derp;           /* Enable DERP relay (default: true) */
+     bool enable_stun;           /* Enable STUN endpoint discovery */
+@@ -57,15 +57,18 @@ typedef struct {
+ } microlink_peer_info_t;
+ 
+ /* Connection state */
+-typedef enum {
++typedef enum {
+     ML_STATE_IDLE = 0,
+     ML_STATE_WIFI_WAIT,
+     ML_STATE_CONNECTING,
+     ML_STATE_REGISTERING,
+     ML_STATE_CONNECTED,
+-    ML_STATE_RECONNECTING,
+-    ML_STATE_ERROR,
+-} microlink_state_t;
++    ML_STATE_RECONNECTING,
++    ML_STATE_ERROR,
++    ML_STATE_NEEDS_AUTH,
++    ML_STATE_NEEDS_APPROVAL,
++    ML_STATE_NODE_KEY_EXPIRED,
++} microlink_state_t;
+ 
+ /* Callback types */
+ typedef void (*microlink_state_cb_t)(microlink_t *ml, microlink_state_t state, void *user_data);
+@@ -82,7 +85,15 @@ typedef void (*microlink_data_cb_t)(microlink_t *ml, uint32_t src_ip, const uint
+  * - Cached peer data (NVS namespace "ml_peers")
+  * After reset, next microlink_init() will generate fresh keys.
+  */
+-esp_err_t microlink_factory_reset(void);
++esp_err_t microlink_factory_reset(void);
++
++/**
++ * @brief Rotate only the WireGuard/node key, preserving the machine identity
++ *
++ * The previous public node key is retained until registration succeeds so it
++ * can be sent as RegisterRequest.OldNodeKey. Call before microlink_init().
++ */
++esp_err_t microlink_rotate_node_key(void);
+ 
+ /**
+  * @brief Initialize MicroLink
+@@ -140,7 +151,19 @@ void microlink_destroy(microlink_t *ml);
+ /**
+  * @brief Get current connection state
+  */
+-microlink_state_t microlink_get_state(const microlink_t *ml);
++microlink_state_t microlink_get_state(const microlink_t *ml);
++
++/**
++ * @brief Copy the pending browser authorization URL
++ * @return ESP_OK when a URL was copied, ESP_ERR_NOT_FOUND otherwise
++ */
++esp_err_t microlink_get_auth_url(const microlink_t *ml, char *buffer, size_t length);
++
++/**
++ * @brief Copy the latest control-plane error message
++ * @return ESP_OK when a message was copied, ESP_ERR_NOT_FOUND otherwise
++ */
++esp_err_t microlink_get_control_error(const microlink_t *ml, char *buffer, size_t length);
+ 
+ /**
+  * @brief Check if connected and ready to send/receive
 diff --git a/components/microlink/include/microlink_internal.h b/components/microlink/include/microlink_internal.h
-index add69c7..1c68b17 100644
+index add69c7fbedcbc506a63912c771072b34ebb65e7..a708bfb7ed07e3a0b654e15b8b60cd861fd99714 100644
 --- a/components/microlink/include/microlink_internal.h
 +++ b/components/microlink/include/microlink_internal.h
 @@ -16,17 +16,16 @@
@@ -75,8 +283,618 @@ index add69c7..1c68b17 100644
      uint64_t last_recv_ms;          /* For keepalive watchdog */
  } ml_derp_conn_t;
  
+@@ -362,8 +361,10 @@ struct microlink_s {
+     /* Keys (loaded at init, read-only after) */
+     uint8_t machine_private_key[32];    /* Noise machine key */
+     uint8_t machine_public_key[32];
+-    uint8_t wg_private_key[32];         /* WireGuard key */
+-    uint8_t wg_public_key[32];
++    uint8_t wg_private_key[32];         /* WireGuard key */
++    uint8_t wg_public_key[32];
++    uint8_t old_wg_public_key[32];      /* Previous node key during rotation */
++    bool has_old_wg_public_key;
+     uint8_t disco_private_key[32];      /* DISCO key */
+     uint8_t disco_public_key[32];
+ 
+@@ -418,7 +419,12 @@ struct microlink_s {
+ 
+     /* Key expiry (parsed from MapResponse self-node) */
+     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
+-    bool key_expired;               /* true if Node.Expired == true */
++    bool key_expired;               /* true if Node.Expired == true */
++
++    /* Interactive registration state. Auth URLs are deliberately RAM-only. */
++    char auth_url[512];
++    char control_error[192];
++    bool approval_pending;
+ 
+     /* Resolved timing (set during init from config, 0 = default) */
+     uint32_t t_disco_heartbeat_ms;
+@@ -452,7 +458,10 @@ struct microlink_s {
+     /* Zero-copy WG: raw PCB replaces disco_sock4 BSD socket */
+     ml_zerocopy_t zc;
+ #endif
+-};
++};
++
++/* Node-key rotation persistence helpers (implemented in microlink.c). */
++void ml_registration_complete(microlink_t *ml);
+ 
+ /* ============================================================================
+  * Internal Function Declarations (per-module)
+diff --git a/components/microlink/include/ml_register_codec.h b/components/microlink/include/ml_register_codec.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a80fa29e254bbaaf611899777b71e112b4cd783
+--- /dev/null
++++ b/components/microlink/include/ml_register_codec.h
+@@ -0,0 +1,54 @@
++/**
++ * @file ml_register_codec.h
++ * @brief Testable policy for Tailscale register requests and responses
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum {
++    ML_REGISTER_FATAL = -2,
++    ML_REGISTER_RETRY = -1,
++    ML_REGISTER_OK = 0,
++    ML_REGISTER_NEEDS_AUTH,
++    ML_REGISTER_NEEDS_APPROVAL,
++    ML_REGISTER_NODE_KEY_EXPIRED,
++} ml_register_result_t;
++
++typedef struct {
++    const uint8_t *node_key;
++    const uint8_t *old_node_key;
++    const char *auth_key;
++    const char *followup;
++} ml_register_request_fields_t;
++
++typedef struct {
++    bool timed_out;
++    bool followup_active;
++    bool approval_pending;
++    const char *error;
++    bool node_key_expired;
++    const char *auth_url;
++    bool machine_authorized_present;
++    bool machine_authorized;
++} ml_register_response_fields_t;
++
++void ml_register_request_fields_init(ml_register_request_fields_t *fields,
++                                     const uint8_t node_key[32],
++                                     const uint8_t old_node_key[32],
++                                     bool has_old_node_key,
++                                     const char *auth_key,
++                                     const char *followup);
++
++ml_register_result_t ml_register_classify_response(
++    const ml_register_response_fields_t *fields);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/components/microlink/src/microlink.c b/components/microlink/src/microlink.c
+index 237f039656760e5dec13f72d5603f9b5b67d2c69..db9d41f315dd88fd3cc24fb3f59af3c6dde2cf55 100644
+--- a/components/microlink/src/microlink.c
++++ b/components/microlink/src/microlink.c
+@@ -30,8 +30,9 @@ static const char *TAG = "microlink";
+ #define NVS_NAMESPACE       "microlink"
+ #define NVS_KEY_MACHINE_PRI "machine_pri"
+ #define NVS_KEY_MACHINE_PUB "machine_pub"
+-#define NVS_KEY_WG_PRI      "wg_private"
+-#define NVS_KEY_WG_PUB      "wg_public"
++#define NVS_KEY_WG_PRI      "wg_private"
++#define NVS_KEY_WG_PUB      "wg_public"
++#define NVS_KEY_OLD_WG_PUB  "old_wg_pub"
+ #define NVS_KEY_DISCO_PRI   "disco_pri"
+ #define NVS_KEY_DISCO_PUB   "disco_pub"
+ 
+@@ -74,16 +75,23 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
+         nvs_get_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, &key_len);
+     }
+ 
+-    /* WireGuard key */
++    /* WireGuard key */
+     key_len = 32;
+     if (nvs_get_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, &key_len) != ESP_OK) {
+         generate_keypair(ml->wg_private_key, ml->wg_public_key);
+         need_save = true;
+         ESP_LOGI(TAG, "Generated new WireGuard key");
+-    } else {
++    } else {
+         key_len = 32;
+         nvs_get_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, &key_len);
+-    }
++    }
++
++    key_len = sizeof(ml->old_wg_public_key);
++    if (nvs_get_blob(nvs, NVS_KEY_OLD_WG_PUB, ml->old_wg_public_key, &key_len) == ESP_OK &&
++        key_len == sizeof(ml->old_wg_public_key)) {
++        ml->has_old_wg_public_key = true;
++        ESP_LOGI(TAG, "Loaded previous node key for rotation");
++    }
+ 
+     /* DISCO key */
+     key_len = 32;
+@@ -125,7 +133,7 @@ static void *cjson_psram_malloc(size_t size) {
+  * Factory Reset
+  * ========================================================================== */
+ 
+-esp_err_t microlink_factory_reset(void) {
++esp_err_t microlink_factory_reset(void) {
+     esp_err_t err;
+ 
+     /* Erase key namespace */
+@@ -145,15 +153,72 @@ esp_err_t microlink_factory_reset(void) {
+ 
+     ESP_LOGI(TAG, "Factory reset complete");
+     return ESP_OK;
+-}
++}
++
++esp_err_t microlink_rotate_node_key(void) {
++    nvs_handle_t nvs;
++    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
++    if (err != ESP_OK) return err;
++
++    /* The retained old key is also the durable in-progress marker. Refuse a
++     * second rotation even after a reboot so NodeKeyExpired cannot loop and
++     * overwrite the key the control plane expects in OldNodeKey. */
++    uint8_t pending_old_public[32];
++    size_t pending_length = sizeof(pending_old_public);
++    err = nvs_get_blob(nvs, NVS_KEY_OLD_WG_PUB, pending_old_public, &pending_length);
++    if (err == ESP_OK && pending_length == sizeof(pending_old_public)) {
++        nvs_close(nvs);
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (err != ESP_ERR_NVS_NOT_FOUND) {
++        nvs_close(nvs);
++        return err;
++    }
++
++    uint8_t old_public[32];
++    size_t length = sizeof(old_public);
++    err = nvs_get_blob(nvs, NVS_KEY_WG_PUB, old_public, &length);
++    if (err != ESP_OK || length != sizeof(old_public)) {
++        nvs_close(nvs);
++        return err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
++    }
++
++    uint8_t private_key[32];
++    uint8_t public_key[32];
++    generate_keypair(private_key, public_key);
++    err = nvs_set_blob(nvs, NVS_KEY_OLD_WG_PUB, old_public, sizeof(old_public));
++    if (err == ESP_OK)
++        err = nvs_set_blob(nvs, NVS_KEY_WG_PRI, private_key, sizeof(private_key));
++    if (err == ESP_OK)
++        err = nvs_set_blob(nvs, NVS_KEY_WG_PUB, public_key, sizeof(public_key));
++    if (err == ESP_OK)
++        err = nvs_commit(nvs);
++    nvs_close(nvs);
++    memset(private_key, 0, sizeof(private_key));
++    if (err == ESP_OK)
++        ESP_LOGI(TAG, "Rotated node key and retained previous public key");
++    return err;
++}
++
++void ml_registration_complete(microlink_t *ml) {
++    if (!ml || !ml->has_old_wg_public_key) return;
++    nvs_handle_t nvs;
++    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
++        nvs_erase_key(nvs, NVS_KEY_OLD_WG_PUB);
++        nvs_commit(nvs);
++        nvs_close(nvs);
++    }
++    memset(ml->old_wg_public_key, 0, sizeof(ml->old_wg_public_key));
++    ml->has_old_wg_public_key = false;
++}
+ 
+ /* ============================================================================
+  * Public API
+  * ========================================================================== */
+ 
+-microlink_t *microlink_init(const microlink_config_t *config) {
+-    if (!config || !config->auth_key) {
+-        ESP_LOGE(TAG, "Invalid config: auth_key required");
++microlink_t *microlink_init(const microlink_config_t *config) {
++    if (!config) {
++        ESP_LOGE(TAG, "Invalid config");
+         return NULL;
+     }
+ 
+@@ -581,9 +646,27 @@ void microlink_destroy(microlink_t *ml) {
+  * State Queries
+  * ========================================================================== */
+ 
+-microlink_state_t microlink_get_state(const microlink_t *ml) {
++microlink_state_t microlink_get_state(const microlink_t *ml) {
+     return ml ? ml->state : ML_STATE_IDLE;
+-}
++}
++
++static esp_err_t copy_status_string(const char *source, char *buffer, size_t length) {
++    if (!buffer || length == 0) return ESP_ERR_INVALID_ARG;
++    if (!source || !source[0]) {
++        buffer[0] = '\0';
++        return ESP_ERR_NOT_FOUND;
++    }
++    strlcpy(buffer, source, length);
++    return ESP_OK;
++}
++
++esp_err_t microlink_get_auth_url(const microlink_t *ml, char *buffer, size_t length) {
++    return copy_status_string(ml ? ml->auth_url : NULL, buffer, length);
++}
++
++esp_err_t microlink_get_control_error(const microlink_t *ml, char *buffer, size_t length) {
++    return copy_status_string(ml ? ml->control_error : NULL, buffer, length);
++}
+ 
+ bool microlink_is_connected(const microlink_t *ml) {
+     return ml && ml->state == ML_STATE_CONNECTED;
+diff --git a/components/microlink/src/ml_coord.c b/components/microlink/src/ml_coord.c
+index 8da8d4d38b7a245f5727f3ba60544a41ebd4a4ac..34d053dda4ca27982b666a6cd5b89bc0d4c70127 100644
+--- a/components/microlink/src/ml_coord.c
++++ b/components/microlink/src/ml_coord.c
+@@ -21,7 +21,8 @@
+  *            tailscale/control/controlclient/direct.go
+  */
+ 
+-#include "microlink_internal.h"
++#include "microlink_internal.h"
++#include "ml_register_codec.h"
+ #include "x25519.h"
+ #include "esp_log.h"
+ #include "esp_timer.h"
+@@ -44,20 +45,21 @@ static uint8_t s_node_key_challenge[32] = {0};
+ static bool s_has_node_key_challenge = false;
+ 
+ /* Coordination state machine */
+-typedef enum {
++typedef enum {
+     COORD_IDLE,
+     COORD_STUN_PROBE,
+     COORD_DNS_RESOLVE,
+     COORD_TCP_CONNECT,
+     COORD_NOISE_HANDSHAKE,
+     COORD_H2_PREFACE,
+-    COORD_REGISTER,
++    COORD_REGISTER,
++    COORD_WAIT_AUTH,
+     COORD_FETCH_PEERS,
+     COORD_LONG_POLL,
+     COORD_RECONNECTING,
+-} coord_state_t;
+-
+-/* ============================================================================
++} coord_state_t;
++
++/* ============================================================================
+  * Helper: hex encoding for keys
+  * ========================================================================== */
+ 
+@@ -687,7 +689,7 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
+  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
+  * ========================================================================== */
+ 
+-static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
++static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
+     int64_t t_reg_start = esp_timer_get_time();
+ 
+     /* Build RegisterRequest JSON */
+@@ -696,19 +698,38 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
+ 
+     cJSON_AddNumberToObject(root, "Version", ML_CTRL_PROTOCOL_VER);
+ 
+-    /* NodeKey: "nodekey:" + hex(wg_public_key) */
+-    char key_hex[65];
+-    char key_str[80];
+-    bytes_to_hex(ml->wg_public_key, 32, key_hex);
+-    snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
+-    cJSON_AddStringToObject(root, "NodeKey", key_str);
+-
+-    /* Auth - only include if auth_key is valid (matching v1 behavior) */
+-    if (ml->config.auth_key && strlen(ml->config.auth_key) > 0) {
+-        cJSON *auth = cJSON_CreateObject();
+-        cJSON_AddStringToObject(auth, "AuthKey", ml->config.auth_key);
+-        cJSON_AddItemToObject(root, "Auth", auth);
+-    }
++    ml_register_request_fields_t request;
++    ml_register_request_fields_init(&request,
++                                    ml->wg_public_key,
++                                    ml->old_wg_public_key,
++                                    ml->has_old_wg_public_key,
++                                    ml->config.auth_key,
++                                    ml->auth_url);
++
++    /* NodeKey: "nodekey:" + hex(wg_public_key) */
++    char key_hex[65];
++    char key_str[80];
++    bytes_to_hex(request.node_key, 32, key_hex);
++    snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
++    cJSON_AddStringToObject(root, "NodeKey", key_str);
++
++    if (request.old_node_key) {
++        char old_key_hex[65];
++        char old_key_str[80];
++        bytes_to_hex(request.old_node_key, 32, old_key_hex);
++        snprintf(old_key_str, sizeof(old_key_str), "nodekey:%s", old_key_hex);
++        cJSON_AddStringToObject(root, "OldNodeKey", old_key_str);
++    }
++
++    /* Auth - only include if auth_key is valid (matching v1 behavior) */
++    if (request.auth_key) {
++        cJSON *auth = cJSON_CreateObject();
++        cJSON_AddStringToObject(auth, "AuthKey", request.auth_key);
++        cJSON_AddItemToObject(root, "Auth", auth);
++    }
++
++    if (request.followup)
++        cJSON_AddStringToObject(root, "Followup", request.followup);
+ 
+     /* Hostinfo */
+     cJSON *hostinfo = cJSON_CreateObject();
+@@ -891,27 +912,20 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
+ 
+     ESP_LOGI(TAG, "RegisterResponse: %d bytes total data", (int)resp_total);
+ 
+-    if (resp_total == 0) {
+-        ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
+-        free(resp_buf);
+-        /* Not fatal - server may just return headers-only 200 */
+-        return 0;
+-    }
++    if (resp_total == 0) {
++        ESP_LOGD(TAG, "RegisterResponse is still pending");
++        free(resp_buf);
++        const ml_register_response_fields_t fields = {
++            .timed_out = true,
++            .followup_active = ml->auth_url[0] != '\0',
++            .approval_pending = ml->approval_pending,
++        };
++        return ml_register_classify_response(&fields);
++    }
+ 
+     uint8_t *json_data = resp_buf;
+     size_t json_data_len = resp_total;
+ 
+-    /* Hex dump first 32 bytes for debugging prefix issues */
+-    {
+-        int dump = json_data_len < 32 ? (int)json_data_len : 32;
+-        char hexbuf[97];
+-        for (int i = 0; i < dump; i++) {
+-            sprintf(hexbuf + i * 3, "%02x ", json_data[i]);
+-        }
+-        hexbuf[dump * 3] = '\0';
+-        ESP_LOGI(TAG, "RegisterResponse first %d bytes (hex): %s", dump, hexbuf);
+-    }
+-
+     /* Find start of JSON - skip any binary prefix */
+     char *parse_start = (char *)json_data;
+     size_t parse_len = json_data_len;
+@@ -927,9 +941,9 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
+         parse_start += json_offset;
+         parse_len -= json_offset;
+     } else if (json_offset < 0) {
+-        ESP_LOGW(TAG, "No '{' found in RegisterResponse data");
+-        free(resp_buf);
+-        return 0;
++        ESP_LOGW(TAG, "No '{' found in RegisterResponse data");
++        free(resp_buf);
++        return ML_REGISTER_RETRY;
+     }
+ 
+     /* Null-terminate for cJSON */
+@@ -937,15 +951,50 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
+     parse_start[parse_len] = '\0';
+ 
+     cJSON *resp_json = cJSON_Parse(parse_start);
+-    if (!resp_json) {
+-        ESP_LOGW(TAG, "Failed to parse RegisterResponse JSON (len=%d)", (int)parse_len);
+-        ESP_LOGW(TAG, "First 100 chars: %.100s", parse_start);
+-        parse_start[parse_len] = saved;
+-        free(resp_buf);
+-        return 0;  /* Not fatal - we'll get peers in MapResponse */
++    if (!resp_json) {
++        ESP_LOGW(TAG, "Failed to parse RegisterResponse JSON (len=%d)", (int)parse_len);
++        parse_start[parse_len] = saved;
++        free(resp_buf);
++        return ML_REGISTER_RETRY;
+     }
+     parse_start[parse_len] = saved;
+-    free(resp_buf);
++    free(resp_buf);
++
++    cJSON *error = cJSON_GetObjectItem(resp_json, "Error");
++    cJSON *node_key_expired = cJSON_GetObjectItem(resp_json, "NodeKeyExpired");
++    cJSON *auth_url = cJSON_GetObjectItem(resp_json, "AuthURL");
++    cJSON *machine_authorized = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
++    const ml_register_response_fields_t response = {
++        .error = cJSON_IsString(error) ? error->valuestring : NULL,
++        .node_key_expired = cJSON_IsTrue(node_key_expired),
++        .auth_url = cJSON_IsString(auth_url) ? auth_url->valuestring : NULL,
++        .machine_authorized_present = cJSON_IsBool(machine_authorized),
++        .machine_authorized = cJSON_IsTrue(machine_authorized),
++    };
++    ml_register_result_t result = ml_register_classify_response(&response);
++    if (result == ML_REGISTER_FATAL) {
++        if (response.error)
++            strlcpy(ml->control_error, response.error, sizeof(ml->control_error));
++        cJSON_Delete(resp_json);
++        return result;
++    }
++    if (result == ML_REGISTER_NODE_KEY_EXPIRED) {
++        cJSON_Delete(resp_json);
++        return result;
++    }
++    if (result == ML_REGISTER_NEEDS_AUTH) {
++        strlcpy(ml->auth_url, response.auth_url, sizeof(ml->auth_url));
++        ml->approval_pending = false;
++        cJSON_Delete(resp_json);
++        return result;
++    }
++    if (result == ML_REGISTER_NEEDS_APPROVAL) {
++        /* Keep auth_url as the Followup token, but the public state tells UIs
++         * to replace the QR with approval instructions. */
++        ml->approval_pending = true;
++        cJSON_Delete(resp_json);
++        return result;
++    }
+ 
+     /* Extract our VPN IP from Node.Addresses */
+     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
+@@ -997,13 +1046,18 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
+         }
+     }
+ 
+-    cJSON_Delete(resp_json);
++    cJSON_Delete(resp_json);
++
++    ml->auth_url[0] = '\0';
++    ml->control_error[0] = '\0';
++    ml->approval_pending = false;
++    ml_registration_complete(ml);
+ 
+     int64_t t_reg_done = esp_timer_get_time();
+     ESP_LOGI(TAG, "[TIMING] Register total: %lld ms", (t_reg_done - t_reg_start) / 1000);
+ 
+-    return 0;
+-}
++    return ML_REGISTER_OK;
++}
+ 
+ /* ============================================================================
+  * State: FETCH_PEERS - Send MapRequest, parse MapResponse
+@@ -2229,8 +2283,9 @@ void ml_coord_task(void *arg) {
+             state = COORD_NOISE_HANDSHAKE;
+             break;
+ 
+-        case COORD_NOISE_HANDSHAKE:
+-            ml->state = ML_STATE_REGISTERING;
++        case COORD_NOISE_HANDSHAKE:
++            if (!ml->auth_url[0] && !ml->approval_pending)
++                ml->state = ML_STATE_REGISTERING;
+             if (do_noise_handshake(ml, &noise) < 0) {
+                 ESP_LOGE(TAG, "Noise handshake failed");
+                 ml_close_sock(ml->coord_sock);
+@@ -2256,17 +2311,61 @@ void ml_coord_task(void *arg) {
+             state = COORD_REGISTER;
+             break;
+ 
+-        case COORD_REGISTER:
+-            ESP_LOGI(TAG, "Registering...");
+-            if (do_register(ml, &noise) < 0) {
+-                ESP_LOGE(TAG, "Registration failed");
+-                ml_close_sock(ml->coord_sock);
+-                ml->coord_sock = -1;
+-                state = COORD_RECONNECTING;
+-                break;
+-            }
+-            state = COORD_FETCH_PEERS;
+-            break;
++        case COORD_REGISTER:
++            ESP_LOGI(TAG, "Registering...");
++            {
++                ml_register_result_t result = do_register(ml, &noise);
++                if (result == ML_REGISTER_FATAL) {
++                    ESP_LOGE(TAG, "Registration rejected by control plane");
++                    ml->state = ML_STATE_ERROR;
++                    state = COORD_IDLE;
++                    break;
++                }
++                if (result == ML_REGISTER_NODE_KEY_EXPIRED) {
++                    ml->state = ML_STATE_NODE_KEY_EXPIRED;
++                    state = COORD_IDLE;
++                    break;
++                }
++                if (result == ML_REGISTER_NEEDS_AUTH) {
++                    ml->state = ML_STATE_NEEDS_AUTH;
++                    state = COORD_WAIT_AUTH;
++                    break;
++                }
++                if (result == ML_REGISTER_NEEDS_APPROVAL) {
++                    ml->state = ML_STATE_NEEDS_APPROVAL;
++                    state = COORD_WAIT_AUTH;
++                    break;
++                }
++                if (result == ML_REGISTER_RETRY) {
++                ESP_LOGE(TAG, "Registration failed");
++                ml_close_sock(ml->coord_sock);
++                ml->coord_sock = -1;
++                state = COORD_RECONNECTING;
++                break;
++                }
++            }
++            ml->state = ML_STATE_REGISTERING;
++            state = COORD_FETCH_PEERS;
++            break;
++
++        case COORD_WAIT_AUTH:
++            {
++                uint32_t wait_ms = ml->approval_pending ? 10000 : 1000;
++                if (ml->coord_sock >= 0) {
++                    ml_close_sock(ml->coord_sock);
++                    ml->coord_sock = -1;
++                }
++                ml_coord_cmd_t wake_cmd;
++                if (xQueueReceive(ml->coord_cmd_queue, &wake_cmd, pdMS_TO_TICKS(wait_ms)) == pdTRUE &&
++                    wake_cmd == ML_CMD_DISCONNECT) {
++                    state = COORD_IDLE;
++                    ml->state = ML_STATE_IDLE;
++                    break;
++                }
++                memset(&noise, 0, sizeof(noise));
++                state = COORD_STUN_PROBE;
++            }
++            break;
+ 
+         case COORD_FETCH_PEERS:
+             ESP_LOGI(TAG, "Fetching peers...");
+@@ -2488,14 +2587,11 @@ void ml_coord_task(void *arg) {
+                     static uint64_t last_expiry_check_ms = 0;
+                     if (now - last_expiry_check_ms > 60000) {
+                         last_expiry_check_ms = now;
+-                        if (ml->key_expired) {
+-                            if (ml->config.auth_key) {
+-                                ESP_LOGW(TAG, "Key expired, re-registering with auth_key...");
+-                                state = COORD_RECONNECTING;
+-                                break;
+-                            } else {
+-                                ESP_LOGE(TAG, "Key expired but no auth_key — manual re-provisioning needed!");
+-                            }
++                        if (ml->key_expired) {
++                            ESP_LOGW(TAG, "Node key expired; requesting rotation");
++                            ml->state = ML_STATE_NODE_KEY_EXPIRED;
++                            state = COORD_IDLE;
++                            break;
+                         }
+                         /* Warn 1 hour before expiry (rough uptime-based check) */
+                         /* Note: key_expiry_epoch is absolute Unix time, we compare with
+@@ -2552,7 +2648,12 @@ void ml_coord_task(void *arg) {
+                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
+                          (unsigned long)backoff_ms, reconnect_attempts + 1);
+ 
+-                ml->state = ML_STATE_RECONNECTING;
++                if (ml->approval_pending)
++                    ml->state = ML_STATE_NEEDS_APPROVAL;
++                else if (ml->auth_url[0])
++                    ml->state = ML_STATE_NEEDS_AUTH;
++                else
++                    ml->state = ML_STATE_RECONNECTING;
+ 
+                 /* Wait on command queue with backoff timeout (interruptible!) */
+                 ml_coord_cmd_t wake_cmd;
 diff --git a/components/microlink/src/ml_derp.c b/components/microlink/src/ml_derp.c
-index c57fd0f..fd04b03 100644
+index c57fd0fb1ff43bdb44c839c97907ffa112873443..fd04b03ecdc93d8188089d65669fe18815cddc3d 100644
 --- a/components/microlink/src/ml_derp.c
 +++ b/components/microlink/src/ml_derp.c
 @@ -21,21 +21,47 @@
@@ -439,7 +1257,7 @@ index c57fd0f..fd04b03 100644
      /* Drain TX queue */
      ml_derp_tx_item_t item;
 diff --git a/components/microlink/src/ml_noise.c b/components/microlink/src/ml_noise.c
-index 1b0fac2..aa8fd82 100644
+index 1b0fac24938d8fade1e2d6b0d0655e42b191c837..aa8fd82e0f9e5712b3c481b9e8500e0d29dd0d34 100644
 --- a/components/microlink/src/ml_noise.c
 +++ b/components/microlink/src/ml_noise.c
 @@ -17,8 +17,7 @@
@@ -584,90 +1402,54 @@ index 1b0fac2..aa8fd82 100644
                                    ciphertext, ct_len, plaintext) != 0) {
          ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)nonce);
          return ESP_ERR_INVALID_MAC;
-diff --git a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
-index f974c67..f0feaf0 100644
---- a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
-+++ b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
-@@ -5,9 +5,9 @@
- 
- #include "wireguard-platform.h"
- #include "esp_random.h"
--#include "esp_timer.h"
- #include "lwip/sys.h"
- #include <string.h>
-+#include <sys/time.h>
- 
- /* ============================================================================
-  * Time Functions
-@@ -20,17 +20,12 @@ uint32_t wireguard_sys_now() {
- 
- void wireguard_tai64n_now(uint8_t *output) {
-     // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
--    // For simplicity, use Unix epoch time
--    uint64_t now_us = esp_timer_get_time();
--    uint64_t seconds = now_us / 1000000ULL;
--    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
--
--    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
--    static uint64_t last_log_s = 0;
--    if (seconds - last_log_s >= 5) {
--        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
--        last_log_s = seconds;
--    }
-+    // WireGuard rejects replayed handshake timestamps. ESP timer uptime resets
-+    // on every boot, so use the SNTP-synchronized wall clock instead.
-+    struct timeval now;
-+    gettimeofday(&now, NULL);
-+    uint64_t seconds = (uint64_t)now.tv_sec;
-+    uint32_t nanoseconds = (uint32_t)now.tv_usec * 1000;
- 
-     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)
-     // Add TAI offset: 2^62 + Unix time
-diff --git a/components/microlink/src/ml_wg_mgr.c b/components/microlink/src/ml_wg_mgr.c
-index ed40942..bda8fb2 100644
---- a/components/microlink/src/ml_wg_mgr.c
-+++ b/components/microlink/src/ml_wg_mgr.c
-@@ -186,9 +186,9 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
-     microlink_t *ml = (microlink_t *)ctx;
-     if (!ml) return ERR_CONN;
- 
--    /* Log WG packets sent via direct UDP */
-+    /* Per-packet logs are debug-only: INFO output can block when USB is unread. */
-     uint32_t ip_host = ntohl(dest_ip);
--    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
-+    ESP_LOGD(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
-              (int)len,
-              (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
-              (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
-@@ -1145,7 +1145,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
-  * ========================================================================== */
- 
- static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
--    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
-+    ESP_LOGD(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
-              (int)pkt->len, pkt->via_derp,
-              pkt->len >= 4 ? pkt->data[0] : -1,
-              pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
-@@ -1621,7 +1621,7 @@ void ml_wg_mgr_task(void *arg) {
-             wireguardif_periodic((struct netif *)ml->wg_netif);
-             uint64_t dt = ml_get_time_ms() - t0;
-             last_wg_periodic_ms = now;
--            ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
-+            ESP_LOGD(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
-         }
- 
-         /* Periodic DISCO probes (every 1s check) */
-@@ -1631,7 +1631,7 @@ void ml_wg_mgr_task(void *arg) {
-             disco_periodic_probes(ml);
-             uint64_t dt = ml_get_time_ms() - t0;
-             last_disco_probe_ms = now;
--            ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
-+            ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
-         }
- 
-         /* Yield - 10ms loop rate for minimum packet processing latency.
+diff --git a/components/microlink/src/ml_register_codec.c b/components/microlink/src/ml_register_codec.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..145e1552e604630999657b3d38eb3fd189930454
+--- /dev/null
++++ b/components/microlink/src/ml_register_codec.c
+@@ -0,0 +1,40 @@
++/**
++ * @file ml_register_codec.c
++ * @brief Register flow policy kept independent of ESP-IDF and cJSON
++ */
++
++#include "ml_register_codec.h"
++
++#include <stddef.h>
++
++static const char *nonempty(const char *value) {
++    return (value && value[0]) ? value : NULL;
++}
++
++void ml_register_request_fields_init(ml_register_request_fields_t *fields,
++                                     const uint8_t node_key[32],
++                                     const uint8_t old_node_key[32],
++                                     bool has_old_node_key,
++                                     const char *auth_key,
++                                     const char *followup) {
++    if (!fields) return;
++    fields->node_key = node_key;
++    fields->old_node_key = has_old_node_key ? old_node_key : NULL;
++    fields->auth_key = has_old_node_key ? NULL : nonempty(auth_key);
++    fields->followup = nonempty(followup);
++}
++
++ml_register_result_t ml_register_classify_response(
++    const ml_register_response_fields_t *fields) {
++    if (!fields) return ML_REGISTER_FATAL;
++    if (fields->timed_out) {
++        if (fields->approval_pending) return ML_REGISTER_NEEDS_APPROVAL;
++        return fields->followup_active ? ML_REGISTER_NEEDS_AUTH : ML_REGISTER_RETRY;
++    }
++    if (nonempty(fields->error)) return ML_REGISTER_FATAL;
++    if (fields->node_key_expired) return ML_REGISTER_NODE_KEY_EXPIRED;
++    if (nonempty(fields->auth_url)) return ML_REGISTER_NEEDS_AUTH;
++    if (fields->machine_authorized_present && !fields->machine_authorized)
++        return ML_REGISTER_NEEDS_APPROVAL;
++    return ML_REGISTER_OK;
++}
 diff --git a/components/microlink/src/ml_tcp.c b/components/microlink/src/ml_tcp.c
-index e65d72d..4237945 100644
+index e65d72dc823f343eeec02e7cc8a3c734b22bf4d4..4237945d056acc80514f37f4a3102db0ea6e92d1 100644
 --- a/components/microlink/src/ml_tcp.c
 +++ b/components/microlink/src/ml_tcp.c
 @@ -19,6 +19,8 @@
@@ -710,3 +1492,46 @@ index e65d72d..4237945 100644
              }
              ESP_LOGE(TAG, "TCP send failed: n=%d errno=%d (sent %d/%d)",
                       n, errno, (int)sent, (int)len);
+diff --git a/components/microlink/src/ml_wg_mgr.c b/components/microlink/src/ml_wg_mgr.c
+index ed409420033200a43cc0bb877e4635e5cf1c8d68..bda8fb2725b3fa4523a200c2ff79f0a0d6da74e0 100644
+--- a/components/microlink/src/ml_wg_mgr.c
++++ b/components/microlink/src/ml_wg_mgr.c
+@@ -186,9 +186,9 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
+     microlink_t *ml = (microlink_t *)ctx;
+     if (!ml) return ERR_CONN;
+ 
+-    /* Log WG packets sent via direct UDP */
++    /* Per-packet logs are debug-only: INFO output can block when USB is unread. */
+     uint32_t ip_host = ntohl(dest_ip);
+-    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
++    ESP_LOGD(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
+              (int)len,
+              (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
+              (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
+@@ -1145,7 +1145,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
+  * ========================================================================== */
+ 
+ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
+-    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
++    ESP_LOGD(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
+              (int)pkt->len, pkt->via_derp,
+              pkt->len >= 4 ? pkt->data[0] : -1,
+              pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
+@@ -1621,7 +1621,7 @@ void ml_wg_mgr_task(void *arg) {
+             wireguardif_periodic((struct netif *)ml->wg_netif);
+             uint64_t dt = ml_get_time_ms() - t0;
+             last_wg_periodic_ms = now;
+-            ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
++            ESP_LOGD(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+         }
+ 
+         /* Periodic DISCO probes (every 1s check) */
+@@ -1631,7 +1631,7 @@ void ml_wg_mgr_task(void *arg) {
+             disco_periodic_probes(ml);
+             uint64_t dt = ml_get_time_ms() - t0;
+             last_disco_probe_ms = now;
+-            ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
++            ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+         }
+ 
+         /* Yield - 10ms loop rate for minimum packet processing latency.

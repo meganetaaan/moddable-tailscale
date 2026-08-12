@@ -11,6 +11,7 @@ export default class HeadlessStatus {
 		this.tones = {};
 		this.pattern = undefined;
 		this.identifying = false;
+		this.authWaiting = false;
 		this.led = new Digital({
 			pin: LED_PIN,
 			mode: Digital.Output,
@@ -33,6 +34,14 @@ export default class HeadlessStatus {
 		trace(`[${tone}] ${title}: ${detail}\n`);
 	}
 
+	tailnetError() {
+		// The full control-plane error is exposed only through local provisioning.
+		// Do not write it to the normal UART log.
+		this.values.tailnet = "ERROR";
+		this.tones.tailnet = "error";
+		this.refreshLED();
+	}
+
 	identify(deviceId, duration) {
 		trace(`[identify] ${deviceId} for ${duration}ms\n`);
 		this.identifying = true;
@@ -46,9 +55,28 @@ export default class HeadlessStatus {
 		}, duration);
 	}
 
+	authRequired() {
+		this.authWaiting = true;
+		this.setPattern("auth");
+	}
+
+	approvalRequired() {
+		this.authWaiting = true;
+		this.setPattern("auth");
+	}
+
+	clearAuth() {
+		this.authWaiting = false;
+		this.refreshLED();
+	}
+
 	refreshLED() {
 		if (this.identifying)
 			return;
+		if (this.authWaiting) {
+			this.setPattern("auth");
+			return;
+		}
 
 		const ready = (this.tones.wifi === "ok") &&
 			(this.tones.tailnet === "ok") &&
@@ -78,7 +106,7 @@ export default class HeadlessStatus {
 
 		let lit = true;
 		this.led.write(LED_ON);
-		const interval = pattern === "connecting" ? 500 : 125;
+		const interval = pattern === "auth" ? 1000 : pattern === "connecting" ? 500 : 125;
 		this.blinkTimer = Timer.repeat(() => {
 			lit = !lit;
 			this.led.write(lit ? LED_ON : LED_OFF);

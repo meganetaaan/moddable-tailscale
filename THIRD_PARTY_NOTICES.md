@@ -48,6 +48,16 @@ License: MIT
 
 Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
 
+## QR Code Generator for JavaScript
+
+Source: <https://github.com/kazuhikoarase/qrcode-generator>
+
+Version: 1.4.4
+
+License: MIT
+
+Copyright (c) 2009 Kazuhiko Arase
+
 ## Common MIT terms for the components above
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of the applicable software and associated documentation files, to deal in that software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, and to permit persons to whom the software is furnished to do so, subject to the following conditions:

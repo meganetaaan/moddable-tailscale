@@ -58,8 +58,10 @@ struct TailnetManagerRecord {
 	volatile bool task_running;
 	volatile bool tcp_active;
 	volatile bool udp_active;
+	volatile bool restarting;
 	volatile bool closed;
 	volatile bool abandoned;
+	uint8_t rotation_attempts;
 };
 
 struct TailnetTCPRecord {
@@ -198,36 +200,69 @@ static void manager_close_transports(TailnetManagerRecord *manager) {
 		vTaskDelay(pdMS_TO_TICKS(20));
 }
 
+static microlink_t *manager_create_microlink(TailnetManagerRecord *manager) {
+	microlink_config_t config = {
+		.auth_key = manager->auth_key[0] ? manager->auth_key : NULL,
+		.device_name = manager->device_name[0] ? manager->device_name : NULL,
+		.enable_derp = true,
+		.enable_stun = true,
+		.enable_disco = true,
+		.max_peers = 8,
+		.priority_peer_ip = manager->priority_peer,
+	};
+	microlink_t *ml = microlink_init(&config);
+	if (!ml)
+		return NULL;
+	lock(manager->mutex);
+	manager->ml = ml;
+	unlock(manager->mutex);
+	if (microlink_start(ml) != ESP_OK) {
+		lock(manager->mutex);
+		manager->ml = NULL;
+		unlock(manager->mutex);
+		microlink_destroy(ml);
+		return NULL;
+	}
+	return ml;
+}
+
 static void manager_task(void *context) {
 	TailnetManagerRecord *manager = context;
 	uint8_t command;
 
 	while (!manager->stop_requested) {
-		if (xQueueReceive(manager->commands, &command, pdMS_TO_TICKS(100)) != pdTRUE)
+		if (xQueueReceive(manager->commands, &command, pdMS_TO_TICKS(100)) != pdTRUE) {
+			microlink_t *ml = manager_microlink(manager);
+			microlink_state_t state = ml ? microlink_get_state(ml) : ML_STATE_IDLE;
+			if (state == ML_STATE_CONNECTED)
+				manager->rotation_attempts = 0;
+			if (state != ML_STATE_NODE_KEY_EXPIRED)
+				continue;
+			if (manager->rotation_attempts) {
+				manager->last_error = 4;
+				continue;
+			}
+
+			manager->restarting = true;
+			manager_close_transports(manager);
+			lock(manager->mutex);
+			manager->ml = NULL;
+			unlock(manager->mutex);
+			microlink_destroy(ml);
+			manager->rotation_attempts = 1;
+			if ((microlink_rotate_node_key() != ESP_OK) || !manager_create_microlink(manager))
+				manager->last_error = 4;
+			manager->restarting = false;
 			continue;
+		}
 		if (manager->stop_requested)
 			break;
 
 		if (MANAGER_START == command) {
-			microlink_config_t config = {
-				.auth_key = manager->auth_key,
-				.device_name = manager->device_name[0] ? manager->device_name : NULL,
-				.enable_derp = true,
-				.enable_stun = true,
-				.enable_disco = true,
-				.max_peers = 8,
-				.priority_peer_ip = manager->priority_peer,
-			};
-			microlink_t *ml = microlink_init(&config);
-			if (!ml) {
+			if (!manager_create_microlink(manager)) {
 				manager->last_error = 1;
 				continue;
 			}
-			lock(manager->mutex);
-			manager->ml = ml;
-			unlock(manager->mutex);
-			if (microlink_start(ml) != ESP_OK)
-				manager->last_error = 2;
 		}
 		else if (MANAGER_REBIND == command) {
 			microlink_t *ml = manager_microlink(manager);
@@ -269,8 +304,8 @@ void xs_tailscale_manager_constructor(xsMachine *the) {
 		xsUnknownError("no memory");
 	}
 
-	xsmcGet(xsVar(0), xsArg(0), xsID_authKey);
-	xsmcToStringBuffer(xsVar(0), manager->auth_key, sizeof(manager->auth_key));
+	if (xsmcGet(xsVar(0), xsArg(0), xsID_authKey))
+		xsmcToStringBuffer(xsVar(0), manager->auth_key, sizeof(manager->auth_key));
 	if (xsmcGet(xsVar(0), xsArg(0), xsID_deviceName))
 		xsmcToStringBuffer(xsVar(0), manager->device_name, sizeof(manager->device_name));
 	if (xsmcGet(xsVar(0), xsArg(0), xsID_priorityPeer)) {
@@ -361,11 +396,15 @@ void xs_tailscale_manager_release(xsMachine *the) {
 void xs_tailscale_manager_get_state(xsMachine *the) {
 	TailnetManagerRecord *manager = xsmcGetHostDataValidate(xsThis, (void *)&gManagerHooks);
 	if (!manager || manager->closed) {
-		xsmcSetInteger(xsResult, 7);
+		xsmcSetInteger(xsResult, ML_STATE_NODE_KEY_EXPIRED + 1);
 		return;
 	}
 	if (manager->last_error) {
 		xsmcSetInteger(xsResult, ML_STATE_ERROR);
+		return;
+	}
+	if (manager->restarting) {
+		xsmcSetInteger(xsResult, ML_STATE_RECONNECTING);
 		return;
 	}
 	lock(manager->mutex);
@@ -377,6 +416,32 @@ void xs_tailscale_manager_get_state(xsMachine *the) {
 void xs_tailscale_manager_get_error(xsMachine *the) {
 	TailnetManagerRecord *manager = xsmcGetHostDataValidate(xsThis, (void *)&gManagerHooks);
 	xsmcSetInteger(xsResult, manager ? manager->last_error : 0);
+}
+
+void xs_tailscale_manager_get_error_message(xsMachine *the) {
+	TailnetManagerRecord *manager = xsmcGetHostDataValidate(xsThis, (void *)&gManagerHooks);
+	char message[192];
+	message[0] = 0;
+	if (manager) {
+		lock(manager->mutex);
+		if (manager->ml)
+			microlink_get_control_error(manager->ml, message, sizeof(message));
+		unlock(manager->mutex);
+	}
+	if (message[0])
+		xsmcSetString(xsResult, message);
+}
+
+void xs_tailscale_manager_get_auth_url(xsMachine *the) {
+	TailnetManagerRecord *manager = manager_validate(the, xsThis);
+	char url[512];
+	url[0] = 0;
+	lock(manager->mutex);
+	if (manager->ml)
+		microlink_get_auth_url(manager->ml, url, sizeof(url));
+	unlock(manager->mutex);
+	if (url[0])
+		xsmcSetString(xsResult, url);
 }
 
 void xs_tailscale_manager_get_closed(xsMachine *the) {

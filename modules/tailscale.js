@@ -13,6 +13,9 @@ const STATE_NAMES = Object.freeze([
 	"connected",
 	"reconnecting",
 	"error",
+	"needs-auth",
+	"needs-approval",
+	"reconnecting",
 	"closed",
 ]);
 
@@ -21,6 +24,7 @@ const NATIVE_ERRORS = Object.freeze([
 	"MicroLink initialization failed",
 	"MicroLink start failed",
 	"MicroLink rebind failed",
+	"MicroLink node key rotation failed",
 ]);
 
 function parseIPv4(value) {
@@ -60,6 +64,8 @@ class NativeManager extends Native("xs_tailscale_manager_destructor") {
 	release() { native("xs_tailscale_manager_release").call(this); }
 	get state() { return native("xs_tailscale_manager_get_state").call(this); }
 	get error() { return native("xs_tailscale_manager_get_error").call(this); }
+	get errorMessage() { return native("xs_tailscale_manager_get_error_message").call(this); }
+	get authURL() { return native("xs_tailscale_manager_get_auth_url").call(this); }
 	get closed() { return native("xs_tailscale_manager_get_closed").call(this); }
 	get vpnAddress() { return native("xs_tailscale_manager_get_vpn_address").call(this); }
 	get peerCount() { return native("xs_tailscale_manager_get_peer_count").call(this); }
@@ -279,9 +285,12 @@ class Tailnet {
 	#timer;
 	#connectTimeout;
 	#onStateChanged;
+	#onAuthRequired;
 	#onError;
+	#authURL;
 	#startResult;
 	#startDeadline;
+	#startTimeoutRemaining;
 	#rebindResult;
 	#rebindDeadline;
 	#rebindNotBefore;
@@ -289,8 +298,11 @@ class Tailnet {
 	#closing = false;
 	#reportedError;
 
-	constructor(options) {
-		if (!options || (typeof options.authKey !== "string") || !options.authKey.startsWith("tskey-auth-"))
+	constructor(options = {}) {
+		if (!options || (typeof options !== "object"))
+			throw new TypeError("options must be an object");
+		if ((options.authKey !== undefined) &&
+			((typeof options.authKey !== "string") || !options.authKey.startsWith("tskey-auth-")))
 			throw new TypeError("authKey must be a Tailscale auth key");
 		if ((options.deviceName !== undefined) && (typeof options.deviceName !== "string"))
 			throw new TypeError("deviceName must be a string");
@@ -300,12 +312,16 @@ class Tailnet {
 		if (!Number.isInteger(this.#connectTimeout) || (this.#connectTimeout <= 0))
 			throw new RangeError("invalid connectTimeout");
 		this.#onStateChanged = options.onStateChanged;
+		if ((options.onAuthRequired !== undefined) && (typeof options.onAuthRequired !== "function"))
+			throw new TypeError("onAuthRequired must be a function");
+		this.#onAuthRequired = options.onAuthRequired;
 		this.#onError = options.onError;
 		this.#native = new NativeManager(options);
 	}
 
 	get _native() { return this.#native; }
 	get state() { return this.#state; }
+	get authURL() { return this.#authURL; }
 	get vpnAddress() { return this.#native?.vpnAddress; }
 	get peers() {
 		const peers = [];
@@ -368,21 +384,38 @@ class Tailnet {
 		const state = this.#rebindResult && (nativeState === "connected") && (now < this.#rebindNotBefore)
 			? "reconnecting"
 			: nativeState;
+		const authURL = this.#native.authURL;
+		const authChanged = authURL !== this.#authURL;
+		this.#authURL = authURL;
 		this.#setState(state);
+		if (authChanged && authURL)
+			this.#onAuthRequired?.call(this, authURL);
 		if (state === "error") {
-			const error = this.#error(NATIVE_ERRORS[this.#native.error] || "MicroLink connection failed");
+			const error = this.#error(this.#native.errorMessage || NATIVE_ERRORS[this.#native.error] || "MicroLink connection failed");
 			this.#startResult?.reject(error);
 			this.#rebindResult?.reject(error);
 			this.#startResult = this.#rebindResult = undefined;
+			this.#startTimeoutRemaining = undefined;
 			return;
+		}
+		const waitingForUser = (state === "needs-auth") || (state === "needs-approval");
+		if (this.#startResult && waitingForUser && (this.#startDeadline !== undefined)) {
+			this.#startTimeoutRemaining = Math.max(0, this.#startDeadline - now);
+			this.#startDeadline = undefined;
+		}
+		else if (this.#startResult && !waitingForUser && (this.#startDeadline === undefined)) {
+			this.#startDeadline = now + (this.#startTimeoutRemaining ?? this.#connectTimeout);
+			this.#startTimeoutRemaining = undefined;
 		}
 		if (this.#startResult && (state === "connected")) {
 			this.#startResult.resolve(this);
 			this.#startResult = undefined;
+			this.#startTimeoutRemaining = undefined;
 		}
-		else if (this.#startResult && (now >= this.#startDeadline)) {
+		else if (this.#startResult && (this.#startDeadline !== undefined) && (now >= this.#startDeadline)) {
 			this.#startResult.reject(this.#error("Tailnet connection timed out"));
 			this.#startResult = undefined;
+			this.#startTimeoutRemaining = undefined;
 		}
 		if (this.#rebindResult && (state === "connected") && (now >= this.#rebindNotBefore)) {
 			this.#rebindResult.resolve(this);
@@ -400,6 +433,7 @@ class Tailnet {
 		this.#native.start();
 		this.#setState("connecting");
 		this.#startResult = Promise.withResolvers();
+		this.#startTimeoutRemaining = undefined;
 		this.#startDeadline = Date.now() + this.#connectTimeout;
 		this.#ensureTimer();
 		return this.#startResult.promise;
@@ -428,6 +462,7 @@ class Tailnet {
 		this.#startResult?.reject(error);
 		this.#rebindResult?.reject(error);
 		this.#startResult = this.#rebindResult = undefined;
+		this.#startTimeoutRemaining = undefined;
 		this.#closeResult = Promise.withResolvers();
 		this.#closing = true;
 		this.#native.close();
